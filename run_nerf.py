@@ -1,11 +1,6 @@
 import os, sys
 import numpy as np
-import imageio
-import json
-import random
-import time
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import configargparse
 from tqdm import tqdm, trange
@@ -41,31 +36,23 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False):
         rays_d: [num_rays, 3]. Direction of each ray.
     Returns:
         rgb_map: [num_rays, 3]. Estimated RGB color of a ray.
-        disp_map: [num_rays]. Disparity map. Inverse of depth map.
-        acc_map: [num_rays]. Sum of weights along each ray.
         weights: [num_rays, num_samples]. Weights assigned to each sampled color.
-        depth_map: [num_rays]. Estimated distance to object.
     """
     dists = z_vals[...,1:] - z_vals[...,:-1]
     dists = torch.cat([dists, torch.Tensor([1e10]).expand(dists[...,:1].shape)], -1)  # [N_rays, N_samples]
     dists = dists * torch.norm(rays_d[...,None,:], dim=-1)
     rgb = torch.sigmoid(raw[...,:3])  # [N_rays, N_samples, 3]
 
-    noise = 0.
-    if raw_noise_std > 0.:
-        noise = torch.randn(raw[...,3].shape) * raw_noise_std
+    noise = torch.randn(raw[...,3].shape) * raw_noise_std if raw_noise_std > 0. else 0.
     alpha = 1. - torch.exp(-F.relu(raw[...,3] + noise) * dists)  # [N_rays, N_samples]
     weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)), 1.-alpha + 1e-10], -1), -1)[:, :-1]
     rgb_map = torch.sum(weights[...,None] * rgb, -2)  # [N_rays, 3]
 
-    depth_map = torch.sum(weights * z_vals, -1)
-    disp_map = 1./torch.max(1e-10 * torch.ones_like(depth_map), depth_map / torch.sum(weights, -1))
-    acc_map = torch.sum(weights, -1)
-
     if white_bkgd:
+        acc_map = torch.sum(weights, -1)
         rgb_map = rgb_map + (1.-acc_map[...,None])
 
-    return rgb_map, disp_map, acc_map, weights
+    return rgb_map, weights
 
 
 def render_rays(ray_batch, network_fn, network_query_fn, N_samples, perturb=0.,
@@ -85,9 +72,7 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples, perturb=0.,
       raw_noise_std: ...
     Returns:
       rgb_map: [num_rays, 3]. Estimated RGB color of a ray. Comes from fine model.
-      disp_map: [num_rays]. Disparity map. 1 / depth.
-      acc_map: [num_rays]. Accumulated opacity along each ray. Comes from fine model.
-      rgb0: See rgb_map. Output for coarse model.
+      rgb0: [num_rays, 3]. See rgb_map. Output for coarse model.
     """
     assert ray_batch.shape[-1] > 8
     N_rays = ray_batch.shape[0]
@@ -111,7 +96,7 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples, perturb=0.,
 
     pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples, 3]
     raw = network_query_fn(pts, viewdirs, network_fn)
-    rgb_map_0, _, _, weights = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd)
+    rgb_map_0, weights = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd)
 
     # Fine sample
     z_vals_mid = .5 * (z_vals[...,1:] + z_vals[...,:-1])
@@ -120,9 +105,9 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples, perturb=0.,
 
     pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples + N_importance, 3]
     raw = network_query_fn(pts, viewdirs, network_fine)
-    rgb_map, disp_map, acc_map, weights = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd)
+    rgb_map, weights = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd)
 
-    return rgb_map, disp_map, acc_map, rgb_map_0
+    return rgb_map, rgb_map_0
 
 
 def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True, near=0., far=1., **kwargs):
@@ -139,9 +124,7 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True, near=0., far=1
       far: float or array of shape [batch_size]. Farthest distance for a ray.
     Returns:
       rgb_map: [batch_size, 3]. Predicted RGB values for rays.
-      disp_map: [batch_size]. Disparity map. Inverse of depth.
-      acc_map: [batch_size]. Accumulated opacity (alpha) along a ray.
-      rgb_map_0: See rgb_map. Output for coarse model.
+      rgb_map_0 [batch_size, 3]: See rgb_map. Output for coarse model.
     """
     if c2w is not None:
         rays_o, rays_d = get_rays(H, W, K, c2w)  # special case to render full image
@@ -165,7 +148,7 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True, near=0., far=1
 
     # Render and reshape
     all_ret = [render_rays(rays[i:i+chunk], **kwargs) for i in range(0, rays.shape[0], chunk)]
-    all_ret = [torch.cat([x[j] for x in all_ret], 0) for j in range(4)]  # transpose and cat
+    all_ret = [torch.cat([x[j] for x in all_ret], 0) for j in range(2)]  # transpose and cat
     all_ret = [torch.reshape(x, [*sh[:-1], *x.shape[1:]]) for x in all_ret]
     return all_ret
 
@@ -187,9 +170,6 @@ def config_parser(argv=sys.argv):
     parser.add_argument("--lrate_decay", type=int, default=250, help='exponential learning rate decay (in 1000 steps)')
     parser.add_argument("--chunk", type=int, default=1024*32, help='number of rays processed in parallel, decrease if running out of memory')
     parser.add_argument("--netchunk", type=int, default=1024*64, help='number of pts sent through network in parallel, decrease if running out of memory')
-    parser.add_argument("--no_batching", action='store_true', help='only take random rays from 1 image at a time')
-    parser.add_argument("--precrop_iters", type=int, default=0, help='number of steps to train on central crops')
-    parser.add_argument("--precrop_frac", type=float, default=.5, help='fraction of img taken for central crops')
 
     # rendering options
     parser.add_argument("--N_iters", type=int, default=200000, help='number of iterations to train')
@@ -202,7 +182,7 @@ def config_parser(argv=sys.argv):
 
     # dataset options
     parser.add_argument("--dataset_type", type=str, default='llff', help='options: llff / blender')
-    parser.add_argument("--testskip", type=int, default=8, help='will load 1/N images from test/val sets, useful for large datasets like deepvoxels')
+    parser.add_argument("--testskip", type=int, default=8, help='will load 1/N images from test/val sets')
 
     ## blender flags
     parser.add_argument("--white_bkgd", action='store_true', help='set to render synthetic data on a white bkgd (always use for dvoxels)')
@@ -211,7 +191,6 @@ def config_parser(argv=sys.argv):
     ## llff flags
     parser.add_argument("--factor", type=int, default=8, help='downsample factor for LLFF images')
     parser.add_argument("--spherify", action='store_true', help='set for spherical 360 scenes')
-    parser.add_argument("--llffhold", type=int, default=8, help='will take every 1/N images as LLFF test set, paper uses 8')
 
     # logging/saving options
     parser.add_argument("--i_print",   type=int, default=100, help='frequency of console printout and metric logging')
@@ -225,20 +204,16 @@ def train(args):
 
     # Load data
     if args.dataset_type == 'llff':
-        images, poses, bds, render_poses, i_test = load_llff_data(args.datadir, args.factor, recenter=True, bd_factor=.75, spherify=args.spherify)
+        images, poses, bds, render_poses, _ = load_llff_data(args.datadir, args.factor, recenter=True, bd_factor=.75, spherify=args.spherify)
         H, W, focal = poses[0,:3,-1]
         poses = poses[:,:3,:4]
-        if not isinstance(i_test, list):
-            i_test = [i_test]
-        if args.llffhold > 0:
-            i_test = np.arange(images.shape[0])[::args.llffhold]
-        i_val = i_test
-        i_train = np.array([i for i in np.arange(int(images.shape[0])) if i not in i_test and i not in i_val])
+        i_test = np.arange(images.shape[0])[::args.testskip]
+        i_train = np.array([i for i in np.arange(int(images.shape[0])) if i not in i_test])
         near, far = 0., 1.
 
     elif args.dataset_type == 'blender':
         images, poses, render_poses, hwf, i_split = load_blender_data(args.datadir, args.half_res, args.testskip)
-        i_train, i_val, i_test = i_split
+        i_train, _, _ = i_split
         H, W, focal = hwf
         near, far = 2., 6.
         if args.white_bkgd:
@@ -274,70 +249,38 @@ def train(args):
         'near': near, 'far': far}
     render_kwargs_test = {**render_kwargs_train, 'perturb': False, 'raw_noise_std': 0.}
 
-    # Prepare raybatch tensor if batching random rays
+    # Prepare raybatch tensor
     N_rand = args.N_rand
-    use_batching = not args.no_batching
-    if use_batching:
-        # For random ray batching
-        rays = torch.stack([get_rays(H, W, torch.as_tensor(K), torch.as_tensor(p)) for p in poses[:,:3,:4]], 0).numpy() # [N, ro+rd, H, W, 3]
-        rays_rgb = np.concatenate([rays, images[:,None]], 1) # [N, ro+rd+rgb, H, W, 3]
-        rays_rgb = np.transpose(rays_rgb, [0,2,3,1,4]) # [N, H, W, ro+rd+rgb, 3]
-        rays_rgb = np.stack([rays_rgb[i] for i in i_train], 0) # train images only
-        rays_rgb = np.reshape(rays_rgb, [-1,3,3]) # [(N-1)*H*W, ro+rd+rgb, 3]
-        rays_rgb = rays_rgb.astype(np.float32)
-        np.random.shuffle(rays_rgb)
-        i_batch = 0
+    rays = torch.stack([get_rays(H, W, torch.as_tensor(K), torch.as_tensor(p)) for p in poses[:,:3,:4]], 0).numpy() # [N, ro+rd, H, W, 3]
+    rays_rgb = np.concatenate([rays, images[:,None]], 1) # [N, ro+rd+rgb, H, W, 3]
+    rays_rgb = np.transpose(rays_rgb, [0,2,3,1,4]) # [N, H, W, ro+rd+rgb, 3]
+    rays_rgb = np.stack([rays_rgb[i] for i in i_train], 0) # train images only
+    rays_rgb = np.reshape(rays_rgb, [-1,3,3]) # [(N-1)*H*W, ro+rd+rgb, 3]
+    rays_rgb = rays_rgb.astype(np.float32)
+    np.random.shuffle(rays_rgb)
+    i_batch = 0
 
     # Move data to GPU
     poses = torch.Tensor(poses).to(device)
     render_poses = torch.Tensor(render_poses).to(device)
-    if use_batching:
-        images = torch.Tensor(images).to(device)
-        rays_rgb = torch.Tensor(rays_rgb).to(device)
+    images = torch.Tensor(images).to(device)
+    rays_rgb = torch.Tensor(rays_rgb).to(device)
 
     for i in trange(args.N_iters):
 
-        # Sample random ray batch
-        if use_batching:
-            # Random over all images
-            batch = rays_rgb[i_batch:i_batch+N_rand] # [B, 2+1, 3*?]
-            batch = torch.transpose(batch, 0, 1)
-            batch_rays, target_s = batch[:2], batch[2]
+        # Sample random ray batch over all images
+        batch = rays_rgb[i_batch:i_batch+N_rand] # [B, 2+1, 3*?]
+        batch = torch.transpose(batch, 0, 1)
+        batch_rays, target_s = batch[:2], batch[2]
 
-            i_batch += N_rand
-            if i_batch >= rays_rgb.shape[0]:  # Shuffle data after each epoch
-                rand_idx = torch.randperm(rays_rgb.shape[0])
-                rays_rgb = rays_rgb[rand_idx]
-                i_batch = 0
+        i_batch += N_rand
+        if i_batch >= rays_rgb.shape[0]:  # Shuffle data after each epoch
+            rand_idx = torch.randperm(rays_rgb.shape[0])
+            rays_rgb = rays_rgb[rand_idx]
+            i_batch = 0
 
-        else:
-            # Random from one image
-            img_i = np.random.choice(i_train)
-            target = torch.Tensor(images[img_i]).to(device)
-            pose = torch.Tensor(poses[img_i, :3,:4])
-            rays_o, rays_d = get_rays(H, W, K, pose)  # (H, W, 3), (H, W, 3)
-
-            if i < args.precrop_iters:
-                dH = int(H//2 * args.precrop_frac)
-                dW = int(W//2 * args.precrop_frac)
-                coords = torch.stack(
-                    torch.meshgrid(
-                        torch.linspace(H//2 - dH, H//2 + dH - 1, 2*dH),
-                        torch.linspace(W//2 - dW, W//2 + dW - 1, 2*dW),
-                        indexing='ij'), -1)
-            else:
-                coords = torch.stack(torch.meshgrid(torch.linspace(0, H-1, H), torch.linspace(0, W-1, W), indexing='ij'), -1)  # (H, W, 2)
-
-            coords = torch.reshape(coords, [-1,2])  # (H * W, 2)
-            select_inds = np.random.choice(coords.shape[0], size=[N_rand], replace=False)  # (N_rand,)
-            select_coords = coords[select_inds].long()  # (N_rand, 2)
-            rays_o = rays_o[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
-            rays_d = rays_d[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
-            batch_rays = torch.stack([rays_o, rays_d], 0)
-            target_s = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
-
-        #####  Core optimization loop  #####
-        rgb, disp, acc, rgb0 = render(H, W, K, chunk=args.chunk, rays=batch_rays, **render_kwargs_train)
+        # Core optimization loop
+        rgb, rgb0 = render(H, W, K, chunk=args.chunk, rays=batch_rays, **render_kwargs_train)
         optimizer.zero_grad()
         img_loss = img2mse(rgb, target_s)
         img_loss0 = img2mse(rgb0, target_s)
@@ -347,7 +290,7 @@ def train(args):
         optimizer.step()
 
         # NOTE: IMPORTANT!
-        ###   update learning rate   ###
+        # Update learning rate
         decay_rate = 0.1
         decay_steps = args.lrate_decay * 1000
         new_lrate = args.lrate * (decay_rate ** (i / decay_steps))
@@ -367,12 +310,12 @@ def train(args):
 
         if (i+1) % args.i_video == 0:
             rgbs = []
-            for i, c2w in enumerate(tqdm(render_poses)):
+            for i, c2w in enumerate(tqdm(render_poses[:1])):
                 with torch.no_grad():
-                    rgb, _, _, _ = render(H, W, K, chunk=args.chunk, c2w=c2w[:3,:4], **render_kwargs_test)
+                    rgb, _ = render(H, W, K, chunk=args.chunk, c2w=c2w[:3,:4], **render_kwargs_test)
                 rgbs.append(rgb.cpu().numpy())
             rgbs = np.stack(rgbs, 0)
-            imageio.mimwrite(os.path.join(logdir, f'{expname}_spiral_{i+1:06d}_rgb.mp4'), to8b(rgbs), fps=30, quality=8)
+            np.savez_compressed(os.path.join(logdir, f'{args.expname}_spiral_{i+1:06d}_rgb.npz'), to8b(rgbs))
 
         if (i+1) % args.i_print == 0:
             tqdm.write(f"[TRAIN] Iter: {i+1} Loss: {loss.item()}  PSNR: {psnr.item()}")
