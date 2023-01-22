@@ -16,16 +16,10 @@ np.random.seed(0)
 
 def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
     """Prepares inputs and applies network 'fn'."""
-    inputs_flat = torch.reshape(inputs, [-1, inputs.shape[-1]])
-    embedded = embed_fn(inputs_flat)
-
     input_dirs = viewdirs[:,None].expand(inputs.shape)
-    input_dirs_flat = torch.reshape(input_dirs, [-1, input_dirs.shape[-1]])
-    embedded_dirs = embeddirs_fn(input_dirs_flat)
-    embedded = torch.cat([embedded, embedded_dirs], -1)
-
+    embedded = torch.cat([embed_fn(inputs), embeddirs_fn(input_dirs)], -1).flatten(end_dim=1)
     outputs_flat = torch.cat([fn(embedded[i:i+netchunk]) for i in range(0, embedded.shape[0], netchunk)], 0)
-    return torch.reshape(outputs_flat, [*inputs.shape[:-1], outputs_flat.shape[-1]])
+    return outputs_flat.view(*inputs.shape[:-1], outputs_flat.shape[-1])
 
 
 def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False):
@@ -74,31 +68,27 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples, perturb=0.,
       rgb_map: [num_rays, 3]. Estimated RGB color of a ray. Comes from fine model.
       rgb0: [num_rays, 3]. See rgb_map. Output for coarse model.
     """
-    assert ray_batch.shape[-1] > 8
+    assert ray_batch.shape[-1] == 11
     N_rays = ray_batch.shape[0]
-    rays_o, rays_d = ray_batch[:,0:3], ray_batch[:,3:6] # [N_rays, 3] each
-    viewdirs = ray_batch[:,-3:]
-    bounds = torch.reshape(ray_batch[...,6:8], [-1,1,2])
-    near, far = bounds[...,0], bounds[...,1] # [-1,1]
+    rays_o, rays_d, near, far, viewdirs = ray_batch[:,0:3], ray_batch[:,3:6], ray_batch[:,6:7], ray_batch[:,7:8], ray_batch[:,8:11] # [N_rays, 3] each
 
     t_vals = torch.linspace(0., 1., steps=N_samples)
     z_vals = near * (1.-t_vals) + far * (t_vals)
     z_vals = z_vals.expand([N_rays, N_samples])
 
+    # get intervals between samples
     if perturb > 0.:
-        # get intervals between samples
         mids = .5 * (z_vals[...,1:] + z_vals[...,:-1])
         upper = torch.cat([mids, z_vals[...,-1:]], -1)
         lower = torch.cat([z_vals[...,:1], mids], -1)
-        # stratified samples in those intervals
-        t_rand = torch.rand(z_vals.shape)
-        z_vals = lower + (upper - lower) * t_rand
+        z_vals = lower + (upper - lower) * torch.rand(z_vals.shape) # stratified samples in those intervals
 
+    # course sample
     pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples, 3]
     raw = network_query_fn(pts, viewdirs, network_fn)
     rgb_map_0, weights = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd)
 
-    # Fine sample
+    # fine sample
     z_vals_mid = .5 * (z_vals[...,1:] + z_vals[...,:-1])
     z_samples = sample_pdf(z_vals_mid, weights[...,1:-1], N_importance, det=(perturb==0.)).detach()
     z_vals, _ = torch.sort(torch.cat([z_vals, z_samples], -1), -1)
@@ -170,12 +160,12 @@ def config_parser(argv=sys.argv):
     parser.add_argument("--lrate_decay", type=int, default=250, help='exponential learning rate decay (in 1000 steps)')
     parser.add_argument("--chunk", type=int, default=1024*32, help='number of rays processed in parallel, decrease if running out of memory')
     parser.add_argument("--netchunk", type=int, default=1024*64, help='number of pts sent through network in parallel, decrease if running out of memory')
+    parser.add_argument("--perturb", type=float, default=1., help='set to 0. for no jitter, 1. for jitter')
 
     # rendering options
     parser.add_argument("--N_iters", type=int, default=200000, help='number of iterations to train')
     parser.add_argument("--N_samples", type=int, default=64, help='number of coarse samples per ray')
     parser.add_argument("--N_importance", type=int, default=64, help='number of additional fine samples per ray')
-    parser.add_argument("--perturb", type=float, default=1., help='set to 0. for no jitter, 1. for jitter')
     parser.add_argument("--multires", type=int, default=10, help='log2 of max freq for positional encoding (3D location)')
     parser.add_argument("--multires_views", type=int, default=4, help='log2 of max freq for positional encoding (2D direction)')
     parser.add_argument("--raw_noise_std", type=float, default=0., help='std dev of noise added to regularize sigma_a output, 1e0 recommended')
@@ -244,7 +234,7 @@ def train(args):
 
     render_kwargs_train = {
         'network_query_fn' : network_query_fn, 'network_fn' : model, 'network_fine' : model_fine,
-        'perturb' : args.perturb, 'N_importance' : args.N_importance, 'N_samples' : args.N_samples,
+        'perturb': args.perturb, 'N_importance' : args.N_importance, 'N_samples' : args.N_samples,
         'white_bkgd' : args.white_bkgd, 'raw_noise_std' : args.raw_noise_std, 'ndc': args.dataset_type == 'llff',
         'near': near, 'far': far}
     render_kwargs_test = {**render_kwargs_train, 'perturb': False, 'raw_noise_std': 0.}
@@ -322,5 +312,4 @@ def train(args):
 
 
 if __name__=='__main__':
-    args = config_parser()
-    train(args)
+    train(config_parser())
