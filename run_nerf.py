@@ -57,10 +57,7 @@ def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
     return all_ret
 
 
-def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
-                  near=0., far=1.,
-                  use_viewdirs=False, c2w_staticcam=None,
-                  **kwargs):
+def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True, near=0., far=1., c2w_staticcam=None, **kwargs):
     """Render rays
     Args:
       H: int. Height of image in pixels.
@@ -74,7 +71,6 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
       ndc: bool. If True, represent ray origin, direction in NDC coordinates.
       near: float or array of shape [batch_size]. Nearest distance for a ray.
       far: float or array of shape [batch_size]. Farthest distance for a ray.
-      use_viewdirs: bool. If True, use viewing direction of a point in space in model.
       c2w_staticcam: array of shape [3, 4]. If not None, use this transformation matrix for
        camera while using other c2w argument for viewing directions.
     Returns:
@@ -90,14 +86,13 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
         # use provided ray batch
         rays_o, rays_d = rays
 
-    if use_viewdirs:
-        # provide ray directions as input
-        viewdirs = rays_d
-        if c2w_staticcam is not None:
-            # special case to visualize effect of viewdirs
-            rays_o, rays_d = get_rays(H, W, K, c2w_staticcam)
-        viewdirs = viewdirs / torch.norm(viewdirs, dim=-1, keepdim=True)
-        viewdirs = torch.reshape(viewdirs, [-1,3]).float()
+    # provide ray directions as input
+    viewdirs = rays_d
+    if c2w_staticcam is not None:
+        # special case to visualize effect of viewdirs
+        rays_o, rays_d = get_rays(H, W, K, c2w_staticcam)
+    viewdirs = viewdirs / torch.norm(viewdirs, dim=-1, keepdim=True)
+    viewdirs = torch.reshape(viewdirs, [-1,3]).float()
 
     sh = rays_d.shape # [..., 3]
     if ndc:
@@ -109,9 +104,7 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
     rays_d = torch.reshape(rays_d, [-1,3]).float()
 
     near, far = near * torch.ones_like(rays_d[...,:1]), far * torch.ones_like(rays_d[...,:1])
-    rays = torch.cat([rays_o, rays_d, near, far], -1)
-    if use_viewdirs:
-        rays = torch.cat([rays, viewdirs], -1)
+    rays = torch.cat([rays_o, rays_d, near, far, viewdirs], -1)
 
     # Render and reshape
     all_ret = batchify_rays(rays, chunk, **kwargs)
@@ -163,25 +156,22 @@ def render_path(render_poses, hwf, K, chunk, render_kwargs, gt_imgs=None, savedi
 def create_nerf(args):
     """Instantiate NeRF's MLP model."""
     embed_fn = Embedder(args.multires)
+    embeddirs_fn = Embedder(args.multires_views)
     input_ch = embed_fn.out_dim
+    input_ch_views = embeddirs_fn.out_dim
 
-    input_ch_views = 0
-    embeddirs_fn = None
-    if args.use_viewdirs:
-        embeddirs_fn = Embedder(args.multires_views)
-        input_ch_views = embeddirs_fn.out_dim
     output_ch = 5 if args.N_importance > 0 else 4
     skips = [4]
     model = NeRF(D=args.netdepth, W=args.netwidth,
                  input_ch=input_ch, output_ch=output_ch, skips=skips,
-                 input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
+                 input_ch_views=input_ch_views).to(device)
     grad_vars = list(model.parameters())
 
     model_fine = None
     if args.N_importance > 0:
         model_fine = NeRF(D=args.netdepth_fine, W=args.netwidth_fine,
                           input_ch=input_ch, output_ch=output_ch, skips=skips,
-                          input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
+                          input_ch_views=input_ch_views).to(device)
         grad_vars += list(model_fine.parameters())
 
     network_query_fn = lambda inputs, viewdirs, network_fn : run_network(inputs, viewdirs, network_fn,
@@ -227,7 +217,6 @@ def create_nerf(args):
         'network_fine' : model_fine,
         'N_samples' : args.N_samples,
         'network_fn' : model,
-        'use_viewdirs' : args.use_viewdirs,
         'white_bkgd' : args.white_bkgd,
         'raw_noise_std' : args.raw_noise_std,
     }
@@ -408,7 +397,6 @@ def config_parser(argv=sys.argv):
     parser.add_argument("--N_samples", type=int, default=64, help='number of coarse samples per ray')
     parser.add_argument("--N_importance", type=int, default=0, help='number of additional fine samples per ray')
     parser.add_argument("--perturb", type=float, default=1., help='set to 0. for no jitter, 1. for jitter')
-    parser.add_argument("--use_viewdirs", action='store_true', help='use full 5D input instead of 3D')
     parser.add_argument("--multires", type=int, default=10, help='log2 of max freq for positional encoding (3D location)')
     parser.add_argument("--multires_views", type=int, default=4, help='log2 of max freq for positional encoding (2D direction)')
     parser.add_argument("--raw_noise_std", type=float, default=0., help='std dev of noise added to regularize sigma_a output, 1e0 recommended')

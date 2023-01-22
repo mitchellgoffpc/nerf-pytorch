@@ -41,5 +41,4 @@ render_test = False
 shape = greek
 spherify = False
 testskip = 8
-use_viewdirs = True
 white_bkgd = True
