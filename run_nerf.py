@@ -175,7 +175,6 @@ def create_nerf(args):
 
     # NDC only good for LLFF-style forward facing data
     if args.dataset_type != 'llff' or args.no_ndc:
-        print('Not ndc!')
         render_kwargs_train['ndc'] = False
         render_kwargs_train['lindisp'] = args.lindisp
 
@@ -244,7 +243,6 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples, lindisp=Fals
       network_fine: "fine" network with same spec as network_fn.
       white_bkgd: bool. If True, assume a white background.
       raw_noise_std: ...
-      verbose: bool. If True, print more debugging info.
     Returns:
       rgb_map: [num_rays, 3]. Estimated RGB color of a ray. Comes from fine model.
       disp_map: [num_rays]. Disparity map. 1 / depth.
@@ -372,29 +370,24 @@ def train(args):
         images, poses, bds, render_poses, i_test = load_llff_data(args.datadir, args.factor, recenter=True, bd_factor=.75, spherify=args.spherify)
         hwf = poses[0,:3,-1]
         poses = poses[:,:3,:4]
-        print('Loaded llff', images.shape, render_poses.shape, hwf, args.datadir)
         if not isinstance(i_test, list):
             i_test = [i_test]
 
         if args.llffhold > 0:
-            print('Auto LLFF holdout,', args.llffhold)
             i_test = np.arange(images.shape[0])[::args.llffhold]
 
         i_val = i_test
         i_train = np.array([i for i in np.arange(int(images.shape[0])) if i not in i_test and i not in i_val])
 
-        print('DEFINING BOUNDS')
         if args.no_ndc:
             near = np.ndarray.min(bds) * .9
             far = np.ndarray.max(bds) * 1.
         else:
             near = 0.
             far = 1.
-        print('NEAR FAR', near, far)
 
     elif args.dataset_type == 'blender':
         images, poses, render_poses, hwf, i_split = load_blender_data(args.datadir, args.half_res, args.testskip)
-        print('Loaded blender', images.shape, render_poses.shape, hwf, args.datadir)
         i_train, i_val, i_test = i_split
         near = 2.
         far = 6.
@@ -407,6 +400,9 @@ def train(args):
     else:
         print('Unknown dataset type', args.dataset_type, 'exiting')
         return
+
+    logdir = os.path.join(args.basedir, args.expname)
+    os.makedirs(logdir, exist_ok=True)
 
     # Cast intrinsics to right types
     H, W, focal = hwf
@@ -436,18 +432,13 @@ def train(args):
     use_batching = not args.no_batching
     if use_batching:
         # For random ray batching
-        print('get rays')
         rays = np.stack([get_rays_np(H, W, K, p) for p in poses[:,:3,:4]], 0) # [N, ro+rd, H, W, 3]
-        print('done, concats')
         rays_rgb = np.concatenate([rays, images[:,None]], 1) # [N, ro+rd+rgb, H, W, 3]
         rays_rgb = np.transpose(rays_rgb, [0,2,3,1,4]) # [N, H, W, ro+rd+rgb, 3]
         rays_rgb = np.stack([rays_rgb[i] for i in i_train], 0) # train images only
         rays_rgb = np.reshape(rays_rgb, [-1,3,3]) # [(N-1)*H*W, ro+rd+rgb, 3]
         rays_rgb = rays_rgb.astype(np.float32)
-        print('shuffle rays')
         np.random.shuffle(rays_rgb)
-
-        print('done')
         i_batch = 0
 
     # Move training data to GPU
@@ -455,11 +446,6 @@ def train(args):
     if use_batching:
         images = torch.Tensor(images).to(device)
         rays_rgb = torch.Tensor(rays_rgb).to(device)
-
-    print('Begin')
-    print('TRAIN views are', i_train)
-    print('TEST views are', i_test)
-    print('VAL views are', i_val)
 
     start = start + 1
     for i in trange(start, args.N_iters + 1):
@@ -473,7 +459,6 @@ def train(args):
 
             i_batch += N_rand
             if i_batch >= rays_rgb.shape[0]:
-                print("Shuffle data after an epoch!")
                 rand_idx = torch.randperm(rays_rgb.shape[0])
                 rays_rgb = rays_rgb[rand_idx]
                 i_batch = 0
@@ -494,12 +479,10 @@ def train(args):
                     coords = torch.stack(
                         torch.meshgrid(
                             torch.linspace(H//2 - dH, H//2 + dH - 1, 2*dH),
-                            torch.linspace(W//2 - dW, W//2 + dW - 1, 2*dW)
-                        ), -1)
-                    if i == start:
-                        print(f"[Config] Center cropping of size {2*dH} x {2*dW} is enabled until iter {args.precrop_iters}")
+                            torch.linspace(W//2 - dW, W//2 + dW - 1, 2*dW),
+                            indexing='ij'), -1)
                 else:
-                    coords = torch.stack(torch.meshgrid(torch.linspace(0, H-1, H), torch.linspace(0, W-1, W)), -1)  # (H, W, 2)
+                    coords = torch.stack(torch.meshgrid(torch.linspace(0, H-1, H), torch.linspace(0, W-1, W), indexing='ij'), -1)  # (H, W, 2)
 
                 coords = torch.reshape(coords, [-1,2])  # (H * W, 2)
                 select_inds = np.random.choice(coords.shape[0], size=[N_rand], replace=False)  # (N_rand,)
@@ -534,7 +517,7 @@ def train(args):
 
         # Rest is logging
         if i % args.i_weights == 0 and i > 0:
-            path = os.path.join(args.basedir, args.expname, '{:06d}.ckpt'.format(i))
+            path = os.path.join(logdir, '{:06d}.ckpt'.format(i))
             torch.save({
                 'global_step': global_step,
                 'network_fn_state_dict': render_kwargs_train['network_fn'].state_dict(),
@@ -547,7 +530,7 @@ def train(args):
             with torch.no_grad():
                 rgbs, disps = render_path(render_poses, hwf, K, args.chunk, render_kwargs_test)
             print('Done, saving', rgbs.shape, disps.shape)
-            moviebase = os.path.join(args.basedir, args.expname, '{}_spiral_{:06d}_'.format(expname, i))
+            moviebase = os.path.join(logdir, '{}_spiral_{:06d}_'.format(expname, i))
             imageio.mimwrite(moviebase + 'rgb.mp4', to8b(rgbs), fps=30, quality=8)
             imageio.mimwrite(moviebase + 'disp.mp4', to8b(disps / np.max(disps)), fps=30, quality=8)
 
