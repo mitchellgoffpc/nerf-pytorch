@@ -418,7 +418,7 @@ def render_rays(ray_batch,
     return ret
 
 
-def config_parser():
+def config_parser(argv=sys.argv):
 
     import configargparse
     parser = configargparse.ArgumentParser()
@@ -458,6 +458,8 @@ def config_parser():
                         help='specific weights npy file to reload for coarse network')
 
     # rendering options
+    parser.add_argument("--N_iters", type=int, default=200000,
+                        help='number of iterations to train')
     parser.add_argument("--N_samples", type=int, default=64,
                         help='number of coarse samples per ray')
     parser.add_argument("--N_importance", type=int, default=0,
@@ -528,13 +530,10 @@ def config_parser():
     parser.add_argument("--i_video",   type=int, default=50000,
                         help='frequency of render_poses video saving')
 
-    return parser
+    return parser.parse_args(argv)
 
 
-def train():
-
-    parser = config_parser()
-    args = parser.parse_args()
+def train(args):
 
     # Load data
     K = None
@@ -698,7 +697,6 @@ def train():
         rays_rgb = torch.Tensor(rays_rgb).to(device)
 
 
-    N_iters = 200000 + 1
     print('Begin')
     print('TRAIN views are', i_train)
     print('TEST views are', i_test)
@@ -708,7 +706,7 @@ def train():
     # writer = SummaryWriter(os.path.join(basedir, 'summaries', expname))
 
     start = start + 1
-    for i in trange(start, N_iters):
+    for i in trange(start, args.N_iters + 1):
         time0 = time.time()
 
         # Sample random ray batch
@@ -790,7 +788,7 @@ def train():
 
         # Rest is logging
         if i%args.i_weights==0:
-            path = os.path.join(basedir, expname, '{:06d}.tar'.format(i))
+            path = os.path.join(basedir, expname, '{:06d}.ckpt'.format(i))
             torch.save({
                 'global_step': global_step,
                 'network_fn_state_dict': render_kwargs_train['network_fn'].state_dict(),
@@ -875,4 +873,5 @@ def train():
 if __name__=='__main__':
     torch.set_default_tensor_type('torch.cuda.FloatTensor')
 
-    train()
+    args = config_parser()
+    train(args)
