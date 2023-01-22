@@ -19,97 +19,18 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 np.random.seed(0)
 
 
-def batchify(fn, chunk, inputs):
-    """Constructs a version of 'fn' that applies to smaller batches."""
-    return torch.cat([fn(inputs[i:i+chunk]) for i in range(0, inputs.shape[0], chunk)], 0)
-
 def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
     """Prepares inputs and applies network 'fn'."""
     inputs_flat = torch.reshape(inputs, [-1, inputs.shape[-1]])
     embedded = embed_fn(inputs_flat)
 
-    if viewdirs is not None:
-        input_dirs = viewdirs[:,None].expand(inputs.shape)
-        input_dirs_flat = torch.reshape(input_dirs, [-1, input_dirs.shape[-1]])
-        embedded_dirs = embeddirs_fn(input_dirs_flat)
-        embedded = torch.cat([embedded, embedded_dirs], -1)
+    input_dirs = viewdirs[:,None].expand(inputs.shape)
+    input_dirs_flat = torch.reshape(input_dirs, [-1, input_dirs.shape[-1]])
+    embedded_dirs = embeddirs_fn(input_dirs_flat)
+    embedded = torch.cat([embedded, embedded_dirs], -1)
 
-    outputs_flat = batchify(fn, netchunk, embedded)
-    outputs = torch.reshape(outputs_flat, list(inputs.shape[:-1]) + [outputs_flat.shape[-1]])
-    return outputs
-
-def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
-    """Render rays in smaller minibatches to avoid OOM."""
-    all_ret = {}
-    for i in range(0, rays_flat.shape[0], chunk):
-        ret = render_rays(rays_flat[i:i+chunk], **kwargs)
-        for k in ret:
-            if k not in all_ret:
-                all_ret[k] = []
-            all_ret[k].append(ret[k])
-
-    return {k : torch.cat(all_ret[k], 0) for k in all_ret}
-
-
-def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True, near=0., far=1., c2w_staticcam=None, **kwargs):
-    """Render rays
-    Args:
-      H: int. Height of image in pixels.
-      W: int. Width of image in pixels.
-      focal: float. Focal length of pinhole camera.
-      chunk: int. Maximum number of rays to process simultaneously. Used to
-        control maximum memory usage. Does not affect final results.
-      rays: array of shape [2, batch_size, 3]. Ray origin and direction for
-        each example in batch.
-      c2w: array of shape [3, 4]. Camera-to-world transformation matrix.
-      ndc: bool. If True, represent ray origin, direction in NDC coordinates.
-      near: float or array of shape [batch_size]. Nearest distance for a ray.
-      far: float or array of shape [batch_size]. Farthest distance for a ray.
-      c2w_staticcam: array of shape [3, 4]. If not None, use this transformation matrix for
-       camera while using other c2w argument for viewing directions.
-    Returns:
-      rgb_map: [batch_size, 3]. Predicted RGB values for rays.
-      disp_map: [batch_size]. Disparity map. Inverse of depth.
-      acc_map: [batch_size]. Accumulated opacity (alpha) along a ray.
-      extras: dict with everything returned by render_rays().
-    """
-    if c2w is not None:
-        # special case to render full image
-        rays_o, rays_d = get_rays(H, W, K, c2w)
-    else:
-        # use provided ray batch
-        rays_o, rays_d = rays
-
-    # provide ray directions as input
-    viewdirs = rays_d
-    if c2w_staticcam is not None:
-        # special case to visualize effect of viewdirs
-        rays_o, rays_d = get_rays(H, W, K, c2w_staticcam)
-    viewdirs = viewdirs / torch.norm(viewdirs, dim=-1, keepdim=True)
-    viewdirs = torch.reshape(viewdirs, [-1,3]).float()
-
-    sh = rays_d.shape # [..., 3]
-    if ndc:
-        # for forward facing scenes
-        rays_o, rays_d = ndc_rays(H, W, K[0][0], 1., rays_o, rays_d)
-
-    # Create ray batch
-    rays_o = torch.reshape(rays_o, [-1,3]).float()
-    rays_d = torch.reshape(rays_d, [-1,3]).float()
-
-    near, far = near * torch.ones_like(rays_d[...,:1]), far * torch.ones_like(rays_d[...,:1])
-    rays = torch.cat([rays_o, rays_d, near, far, viewdirs], -1)
-
-    # Render and reshape
-    all_ret = batchify_rays(rays, chunk, **kwargs)
-    for k in all_ret:
-        k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
-        all_ret[k] = torch.reshape(all_ret[k], k_sh)
-
-    k_extract = ['rgb_map', 'disp_map', 'acc_map']
-    ret_list = [all_ret[k] for k in k_extract]
-    ret_dict = {k : all_ret[k] for k in all_ret if k not in k_extract}
-    return ret_list + [ret_dict]
+    outputs_flat = torch.cat([fn(embedded[i:i+netchunk]) for i in range(0, embedded.shape[0], netchunk)], 0)
+    return torch.reshape(outputs_flat, [*inputs.shape[:-1], outputs_flat.shape[-1]])
 
 
 def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False):
@@ -128,14 +49,12 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False):
     dists = z_vals[...,1:] - z_vals[...,:-1]
     dists = torch.cat([dists, torch.Tensor([1e10]).expand(dists[...,:1].shape)], -1)  # [N_rays, N_samples]
     dists = dists * torch.norm(rays_d[...,None,:], dim=-1)
-
     rgb = torch.sigmoid(raw[...,:3])  # [N_rays, N_samples, 3]
+
     noise = 0.
     if raw_noise_std > 0.:
         noise = torch.randn(raw[...,3].shape) * raw_noise_std
-
     alpha = 1. - torch.exp(-F.relu(raw[...,3] + noise) * dists)  # [N_rays, N_samples]
-    # weights = alpha * tf.math.cumprod(1.-alpha + 1e-10, -1, exclusive=True)
     weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)), 1.-alpha + 1e-10], -1), -1)[:, :-1]
     rgb_map = torch.sum(weights[...,None] * rgb, -2)  # [N_rays, 3]
 
@@ -168,15 +87,12 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples, perturb=0.,
       rgb_map: [num_rays, 3]. Estimated RGB color of a ray. Comes from fine model.
       disp_map: [num_rays]. Disparity map. 1 / depth.
       acc_map: [num_rays]. Accumulated opacity along each ray. Comes from fine model.
-      raw: [num_rays, num_samples, 4]. Raw predictions from model.
       rgb0: See rgb_map. Output for coarse model.
-      disp0: See disp_map. Output for coarse model.
-      acc0: See acc_map. Output for coarse model.
-      z_std: [num_rays]. Standard deviation of distances along ray for each sample.
     """
+    assert ray_batch.shape[-1] > 8
     N_rays = ray_batch.shape[0]
     rays_o, rays_d = ray_batch[:,0:3], ray_batch[:,3:6] # [N_rays, 3] each
-    viewdirs = ray_batch[:,-3:] if ray_batch.shape[-1] > 8 else None
+    viewdirs = ray_batch[:,-3:]
     bounds = torch.reshape(ray_batch[...,6:8], [-1,1,2])
     near, far = bounds[...,0], bounds[...,1] # [-1,1]
 
@@ -195,27 +111,63 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples, perturb=0.,
 
     pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples, 3]
     raw = network_query_fn(pts, viewdirs, network_fn)
-    rgb_map_0, disp_map_0, acc_map_0, weights = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd)
+    rgb_map_0, _, _, weights = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd)
 
     # Fine sample
     z_vals_mid = .5 * (z_vals[...,1:] + z_vals[...,:-1])
-    z_samples = sample_pdf(z_vals_mid, weights[...,1:-1], N_importance, det=(perturb==0.))
-    z_samples = z_samples.detach()
+    z_samples = sample_pdf(z_vals_mid, weights[...,1:-1], N_importance, det=(perturb==0.)).detach()
     z_vals, _ = torch.sort(torch.cat([z_vals, z_samples], -1), -1)
 
     pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples + N_importance, 3]
     raw = network_query_fn(pts, viewdirs, network_fine)
     rgb_map, disp_map, acc_map, weights = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd)
 
-    return {
-      'rgb_map': rgb_map,
-      'disp_map' : disp_map,
-      'acc_map' : acc_map,
-      'rgb0': rgb_map_0,
-      'disp0': disp_map_0,
-      'acc0': acc_map_0,
-      'z_std': torch.std(z_samples, dim=-1, unbiased=False),  # [N_rays]
-      'raw': raw}
+    return rgb_map, disp_map, acc_map, rgb_map_0
+
+
+def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True, near=0., far=1., **kwargs):
+    """Render rays
+    Args:
+      H: int. Height of image in pixels.
+      W: int. Width of image in pixels.
+      focal: float. Focal length of pinhole camera.
+      chunk: int. Maximum number of rays to process simultaneously. Used to control maximum memory usage. Does not affect final results.
+      rays: array of shape [2, batch_size, 3]. Ray origin and direction for each example in batch.
+      c2w: array of shape [3, 4]. Camera-to-world transformation matrix.
+      ndc: bool. If True, represent ray origin, direction in NDC coordinates.
+      near: float or array of shape [batch_size]. Nearest distance for a ray.
+      far: float or array of shape [batch_size]. Farthest distance for a ray.
+    Returns:
+      rgb_map: [batch_size, 3]. Predicted RGB values for rays.
+      disp_map: [batch_size]. Disparity map. Inverse of depth.
+      acc_map: [batch_size]. Accumulated opacity (alpha) along a ray.
+      rgb_map_0: See rgb_map. Output for coarse model.
+    """
+    if c2w is not None:
+        rays_o, rays_d = get_rays(H, W, K, c2w)  # special case to render full image
+    else:
+        rays_o, rays_d = rays  # use provided ray batch
+
+    # provide ray directions as input
+    viewdirs = rays_d
+    viewdirs = viewdirs / torch.norm(viewdirs, dim=-1, keepdim=True)
+    viewdirs = torch.reshape(viewdirs, [-1,3]).float()
+
+    sh = rays_d.shape # [..., 3]
+    if ndc:
+        rays_o, rays_d = ndc_rays(H, W, K[0][0], 1., rays_o, rays_d)  # for forward facing scenes
+
+    # Create ray batch
+    rays_o = torch.reshape(rays_o, [-1,3]).float()
+    rays_d = torch.reshape(rays_d, [-1,3]).float()
+    near, far = near * torch.ones_like(rays_d[...,:1]), far * torch.ones_like(rays_d[...,:1])
+    rays = torch.cat([rays_o, rays_d, near, far, viewdirs], -1)
+
+    # Render and reshape
+    all_ret = [render_rays(rays[i:i+chunk], **kwargs) for i in range(0, rays.shape[0], chunk)]
+    all_ret = [torch.cat([x[j] for x in all_ret], 0) for j in range(4)]  # transpose and cat
+    all_ret = [torch.reshape(x, [*sh[:-1], *x.shape[1:]]) for x in all_ret]
+    return all_ret
 
 
 def config_parser(argv=sys.argv):
@@ -236,6 +188,8 @@ def config_parser(argv=sys.argv):
     parser.add_argument("--chunk", type=int, default=1024*32, help='number of rays processed in parallel, decrease if running out of memory')
     parser.add_argument("--netchunk", type=int, default=1024*64, help='number of pts sent through network in parallel, decrease if running out of memory')
     parser.add_argument("--no_batching", action='store_true', help='only take random rays from 1 image at a time')
+    parser.add_argument("--precrop_iters", type=int, default=0, help='number of steps to train on central crops')
+    parser.add_argument("--precrop_frac", type=float, default=.5, help='fraction of img taken for central crops')
 
     # rendering options
     parser.add_argument("--N_iters", type=int, default=200000, help='number of iterations to train')
@@ -245,10 +199,6 @@ def config_parser(argv=sys.argv):
     parser.add_argument("--multires", type=int, default=10, help='log2 of max freq for positional encoding (3D location)')
     parser.add_argument("--multires_views", type=int, default=4, help='log2 of max freq for positional encoding (2D direction)')
     parser.add_argument("--raw_noise_std", type=float, default=0., help='std dev of noise added to regularize sigma_a output, 1e0 recommended')
-
-    # training options
-    parser.add_argument("--precrop_iters", type=int, default=0, help='number of steps to train on central crops')
-    parser.add_argument("--precrop_frac", type=float, default=.5, help='fraction of img taken for central crops')
 
     # dataset options
     parser.add_argument("--dataset_type", type=str, default='llff', help='options: llff / blender')
@@ -260,7 +210,6 @@ def config_parser(argv=sys.argv):
 
     ## llff flags
     parser.add_argument("--factor", type=int, default=8, help='downsample factor for LLFF images')
-    parser.add_argument("--no_ndc", action='store_true', help='do not use normalized device coordinates (set for non-forward facing scenes)')
     parser.add_argument("--spherify", action='store_true', help='set for spherical 360 scenes')
     parser.add_argument("--llffhold", type=int, default=8, help='will take every 1/N images as LLFF test set, paper uses 8')
 
@@ -283,24 +232,15 @@ def train(args):
             i_test = [i_test]
         if args.llffhold > 0:
             i_test = np.arange(images.shape[0])[::args.llffhold]
-
         i_val = i_test
         i_train = np.array([i for i in np.arange(int(images.shape[0])) if i not in i_test and i not in i_val])
-
-        if args.no_ndc:
-            near = np.ndarray.min(bds) * .9
-            far = np.ndarray.max(bds) * 1.
-        else:
-            near = 0.
-            far = 1.
+        near, far = 0., 1.
 
     elif args.dataset_type == 'blender':
         images, poses, render_poses, hwf, i_split = load_blender_data(args.datadir, args.half_res, args.testskip)
         i_train, i_val, i_test = i_split
         H, W, focal = hwf
-        near = 2.
-        far = 6.
-
+        near, far = 2., 6.
         if args.white_bkgd:
             images = images[...,:3]*images[...,-1:] + (1.-images[...,-1:])
         else:
@@ -328,18 +268,10 @@ def train(args):
     optimizer = torch.optim.Adam(params=(*model.parameters(), *model_fine.parameters()), lr=args.lrate, betas=(0.9, 0.999))
 
     render_kwargs_train = {
-        'network_query_fn' : network_query_fn,
-        'perturb' : args.perturb,
-        'N_importance' : args.N_importance,
-        'network_fine' : model_fine,
-        'N_samples' : args.N_samples,
-        'network_fn' : model,
-        'white_bkgd' : args.white_bkgd,
-        'raw_noise_std' : args.raw_noise_std,
-        'ndc': args.dataset_type == 'llff' and not args.no_ndc,  # NDC only good for LLFF-style forward facing data
-        'near': near,
-        'far': far}
-
+        'network_query_fn' : network_query_fn, 'network_fn' : model, 'network_fine' : model_fine,
+        'perturb' : args.perturb, 'N_importance' : args.N_importance, 'N_samples' : args.N_samples,
+        'white_bkgd' : args.white_bkgd, 'raw_noise_std' : args.raw_noise_std, 'ndc': args.dataset_type == 'llff',
+        'near': near, 'far': far}
     render_kwargs_test = {**render_kwargs_train, 'perturb': False, 'raw_noise_std': 0.}
 
     # Prepare raybatch tensor if batching random rays
@@ -381,37 +313,34 @@ def train(args):
         else:
             # Random from one image
             img_i = np.random.choice(i_train)
-            target = images[img_i]
-            target = torch.Tensor(target).to(device)
-            pose = poses[img_i, :3,:4]
+            target = torch.Tensor(images[img_i]).to(device)
+            pose = torch.Tensor(poses[img_i, :3,:4])
+            rays_o, rays_d = get_rays(H, W, K, pose)  # (H, W, 3), (H, W, 3)
 
-            if N_rand is not None:
-                rays_o, rays_d = get_rays(H, W, K, torch.Tensor(pose))  # (H, W, 3), (H, W, 3)
+            if i < args.precrop_iters:
+                dH = int(H//2 * args.precrop_frac)
+                dW = int(W//2 * args.precrop_frac)
+                coords = torch.stack(
+                    torch.meshgrid(
+                        torch.linspace(H//2 - dH, H//2 + dH - 1, 2*dH),
+                        torch.linspace(W//2 - dW, W//2 + dW - 1, 2*dW),
+                        indexing='ij'), -1)
+            else:
+                coords = torch.stack(torch.meshgrid(torch.linspace(0, H-1, H), torch.linspace(0, W-1, W), indexing='ij'), -1)  # (H, W, 2)
 
-                if i < args.precrop_iters:
-                    dH = int(H//2 * args.precrop_frac)
-                    dW = int(W//2 * args.precrop_frac)
-                    coords = torch.stack(
-                        torch.meshgrid(
-                            torch.linspace(H//2 - dH, H//2 + dH - 1, 2*dH),
-                            torch.linspace(W//2 - dW, W//2 + dW - 1, 2*dW),
-                            indexing='ij'), -1)
-                else:
-                    coords = torch.stack(torch.meshgrid(torch.linspace(0, H-1, H), torch.linspace(0, W-1, W), indexing='ij'), -1)  # (H, W, 2)
-
-                coords = torch.reshape(coords, [-1,2])  # (H * W, 2)
-                select_inds = np.random.choice(coords.shape[0], size=[N_rand], replace=False)  # (N_rand,)
-                select_coords = coords[select_inds].long()  # (N_rand, 2)
-                rays_o = rays_o[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
-                rays_d = rays_d[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
-                batch_rays = torch.stack([rays_o, rays_d], 0)
-                target_s = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
+            coords = torch.reshape(coords, [-1,2])  # (H * W, 2)
+            select_inds = np.random.choice(coords.shape[0], size=[N_rand], replace=False)  # (N_rand,)
+            select_coords = coords[select_inds].long()  # (N_rand, 2)
+            rays_o = rays_o[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
+            rays_d = rays_d[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
+            batch_rays = torch.stack([rays_o, rays_d], 0)
+            target_s = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
 
         #####  Core optimization loop  #####
-        rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays, **render_kwargs_train)
+        rgb, disp, acc, rgb0 = render(H, W, K, chunk=args.chunk, rays=batch_rays, **render_kwargs_train)
         optimizer.zero_grad()
         img_loss = img2mse(rgb, target_s)
-        img_loss0 = img2mse(extras['rgb0'], target_s)
+        img_loss0 = img2mse(rgb0, target_s)
         loss = img_loss + img_loss0
         psnr = mse2psnr(img_loss)
         loss.backward()
