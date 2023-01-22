@@ -426,8 +426,8 @@ def train(args):
             param_group['lr'] = new_lrate
 
         # Rest is logging
-        if i % args.i_weights == 0 and i > 0:
-            path = os.path.join(logdir, '{:06d}.ckpt'.format(i))
+        if (i+1) % args.i_weights == 0:
+            path = os.path.join(logdir, f'{i+1:06d}.ckpt')
             torch.save({
                 'global_step': i,
                 'network_fn_state_dict': render_kwargs_train['network_fn'].state_dict(),
@@ -436,17 +436,17 @@ def train(args):
             }, path)
             print('Saved checkpoints at', path)
 
-        if i % args.i_video == 0 and i > 0:
+        if (i+1) % args.i_video == 0:
             rgbs = []
             for i, c2w in enumerate(tqdm(render_poses)):
                 with torch.no_grad():
                     rgb, _, _, _ = render(H, W, K, chunk=args.chunk, c2w=c2w[:3,:4], **render_kwargs_test)
                 rgbs.append(rgb.cpu().numpy())
             rgbs = np.stack(rgbs, 0)
-            imageio.mimwrite(os.path.join(logdir, f'{expname}_spiral_{i:06d}_rgb.mp4'), to8b(rgbs), fps=30, quality=8)
+            imageio.mimwrite(os.path.join(logdir, f'{expname}_spiral_{i+1:06d}_rgb.mp4'), to8b(rgbs), fps=30, quality=8)
 
-        if i % args.i_print == 0 and i > 0:
-            tqdm.write(f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr.item()}")
+        if (i+1) % args.i_print == 0:
+            tqdm.write(f"[TRAIN] Iter: {i+1} Loss: {loss.item()}  PSNR: {psnr.item()}")
 
 
 if __name__=='__main__':

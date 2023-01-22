@@ -1,5 +1,6 @@
 import os
 import torch
+import shutil
 import numpy as np
 from run_nerf import train, config_parser
 
@@ -13,6 +14,9 @@ if __name__=='__main__':
         basedir = './refs'
     else:
         basedir = '/tmp/refs'
+
+    if os.path.exists(basedir):
+        shutil.rmtree(basedir)
 
     for test, expname in TESTS.items():
         print(f"Testing {test}")
