@@ -11,21 +11,15 @@ to8b = lambda x : (255*np.clip(x,0,1)).astype(np.uint8)
 
 # Positional encoding (section 5.1)
 class Embedder:
-    def __init__(self, multires):
-        num_freqs = multires
-        max_freq_log2 = multires-1
-        d = 3
-        out_dim = d
-        embed_fns = [lambda x: x]
+    def __init__(self, num_freqs):
+        self.out_dim = 3
+        self.embed_fns = [lambda x: x]
 
-        freq_bands = 2.**torch.linspace(0., max_freq_log2, steps=num_freqs)
+        freq_bands = 2. ** torch.linspace(0., num_freqs-1, steps=num_freqs)
         for freq in freq_bands:
             for p_fn in [torch.sin, torch.cos]:
-                embed_fns.append(lambda x, p_fn=p_fn, freq=freq: p_fn(x * freq))
-                out_dim += d
-
-        self.embed_fns = embed_fns
-        self.out_dim = out_dim
+                self.embed_fns.append(lambda x, p_fn=p_fn, freq=freq: p_fn(x * freq))
+                self.out_dim += 3
 
     def __call__(self, inputs):
         return torch.cat([fn(inputs) for fn in self.embed_fns], -1)
@@ -33,24 +27,16 @@ class Embedder:
 
 # Model
 class NeRF(nn.Module):
-    def __init__(self, D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips=[4]):
+    def __init__(self, D=8, W=256, input_ch=3, input_ch_views=3):
         super().__init__()
         self.D = D
         self.W = W
         self.input_ch = input_ch
         self.input_ch_views = input_ch_views
-        self.skips = skips
+        self.skips = [4]
 
-        self.pts_linears = nn.ModuleList(
-            [nn.Linear(input_ch, W)] + [nn.Linear(W, W) if i not in self.skips else nn.Linear(W + input_ch, W) for i in range(D-1)])
-
-        ### Implementation according to the official code release (https://github.com/bmild/nerf/blob/master/run_nerf_helpers.py#L104-L105)
+        self.pts_linears = nn.ModuleList([nn.Linear(input_ch, W)] + [nn.Linear(W + (input_ch if i in self.skips else 0), W) for i in range(D-1)])
         self.views_linears = nn.ModuleList([nn.Linear(input_ch_views + W, W//2)])
-
-        ### Implementation according to the paper
-        # self.views_linears = nn.ModuleList(
-        #     [nn.Linear(input_ch_views + W, W//2)] + [nn.Linear(W//2, W//2) for i in range(D//2)])
-
         self.feature_linear = nn.Linear(W, W)
         self.alpha_linear = nn.Linear(W, 1)
         self.rgb_linear = nn.Linear(W//2, 3)
@@ -59,8 +45,7 @@ class NeRF(nn.Module):
         input_pts, input_views = torch.split(x, [self.input_ch, self.input_ch_views], dim=-1)
         h = input_pts
         for i, l in enumerate(self.pts_linears):
-            h = self.pts_linears[i](h)
-            h = F.relu(h)
+            h = F.relu(self.pts_linears[i](h))
             if i in self.skips:
                 h = torch.cat([input_pts, h], -1)
 
@@ -69,8 +54,7 @@ class NeRF(nn.Module):
         h = torch.cat([feature, input_views], -1)
 
         for i, l in enumerate(self.views_linears):
-            h = self.views_linears[i](h)
-            h = F.relu(h)
+            h = F.relu(self.views_linears[i](h))
 
         rgb = self.rgb_linear(h)
         return torch.cat([rgb, alpha], -1)
@@ -78,26 +62,15 @@ class NeRF(nn.Module):
 
 # Ray helpers
 def get_rays(H, W, K, c2w):
-    i, j = torch.meshgrid(torch.linspace(0, W-1, W), torch.linspace(0, H-1, H))  # pytorch's meshgrid has indexing='ij'
+    i, j = torch.meshgrid(torch.linspace(0, W-1, W), torch.linspace(0, H-1, H), indexing='ij')
     i = i.t()
     j = j.t()
-    dirs = torch.stack([(i-K[0][2])/K[0][0], -(j-K[1][2])/K[1][1], -torch.ones_like(i)], -1)
+    dirs = torch.stack([(i-K[0,2]) / K[0,0], -(j-K[1,2]) / K[1,1], -torch.ones_like(i)], -1)
     # Rotate ray directions from camera frame to the world frame
     rays_d = torch.sum(dirs[..., np.newaxis, :] * c2w[:3,:3], -1)  # dot product, equals to: [c2w.dot(dir) for dir in dirs]
     # Translate camera frame's origin to the world frame. It is the origin of all rays.
     rays_o = c2w[:3,-1].expand(rays_d.shape)
-    return rays_o, rays_d
-
-
-def get_rays_np(H, W, K, c2w):
-    i, j = np.meshgrid(np.arange(W, dtype=np.float32), np.arange(H, dtype=np.float32), indexing='xy')
-    dirs = np.stack([(i-K[0][2])/K[0][0], -(j-K[1][2])/K[1][1], -np.ones_like(i)], -1)
-    # Rotate ray directions from camera frame to the world frame
-    rays_d = np.sum(dirs[..., np.newaxis, :] * c2w[:3,:3], -1)  # dot product, equals to: [c2w.dot(dir) for dir in dirs]
-    # Translate camera frame's origin to the world frame. It is the origin of all rays.
-    rays_o = np.broadcast_to(c2w[:3,-1], np.shape(rays_d))
-    return rays_o, rays_d
-
+    return torch.stack([rays_o, rays_d], 0)
 
 def ndc_rays(H, W, focal, near, rays_o, rays_d):
     # Shift ray origins to near plane
@@ -113,10 +86,7 @@ def ndc_rays(H, W, focal, near, rays_o, rays_d):
     d1 = -1./(H/(2.*focal)) * (rays_d[...,1]/rays_d[...,2] - rays_o[...,1]/rays_o[...,2])
     d2 = -2. * near / rays_o[...,2]
 
-    rays_o = torch.stack([o0,o1,o2], -1)
-    rays_d = torch.stack([d0,d1,d2], -1)
-
-    return rays_o, rays_d
+    return torch.stack([o0,o1,o2], -1), torch.stack([d0,d1,d2], -1)
 
 
 # Hierarchical sampling (section 5.2)
@@ -141,8 +111,6 @@ def sample_pdf(bins, weights, N_samples, det=False):
     above = torch.min((cdf.shape[-1]-1) * torch.ones_like(inds), inds)
     inds_g = torch.stack([below, above], -1)  # (batch, N_samples, 2)
 
-    # cdf_g = tf.gather(cdf, inds_g, axis=-1, batch_dims=len(inds_g.shape)-2)
-    # bins_g = tf.gather(bins, inds_g, axis=-1, batch_dims=len(inds_g.shape)-2)
     matched_shape = [inds_g.shape[0], inds_g.shape[1], cdf.shape[-1]]
     cdf_g = torch.gather(cdf.unsqueeze(1).expand(matched_shape), 2, inds_g)
     bins_g = torch.gather(bins.unsqueeze(1).expand(matched_shape), 2, inds_g)
@@ -150,6 +118,4 @@ def sample_pdf(bins, weights, N_samples, det=False):
     denom = (cdf_g[...,1]-cdf_g[...,0])
     denom = torch.where(denom<1e-5, torch.ones_like(denom), denom)
     t = (u-cdf_g[...,0])/denom
-    samples = bins_g[...,0] + t * (bins_g[...,1]-bins_g[...,0])
-
-    return samples
+    return bins_g[...,0] + t * (bins_g[...,1]-bins_g[...,0])
