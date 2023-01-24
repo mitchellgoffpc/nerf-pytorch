@@ -2,7 +2,8 @@ import os
 import torch
 import shutil
 import numpy as np
-from run_nerf import train, config_parser
+from run_nerf import train
+from run_nerf_helpers import load_args
 
 TESTS = {'fern': 'fern_test', 'lego': 'blender_paper_lego'}
 
@@ -24,8 +25,7 @@ if __name__=='__main__':
         print(f"Testing {test}")
         np.random.seed(0)
         torch.manual_seed(42)
-        args = config_parser(['--config', f'configs/{test}.txt', '--N_iters', '1', '--i_weights', '1', *video_args, '--basedir', basedir])
-        train(args)
+        train(load_args(['--config', f'configs/{test}.txt', '--N_iters', '1', '--i_weights', '1', *video_args, '--basedir', basedir]))
 
         if not update_refs:
             ref = torch.load(f'./refs/{expname}/000001.ckpt')

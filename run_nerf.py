@@ -8,6 +8,7 @@ from tqdm import tqdm, trange
 from functools import partial
 from load_llff import load_llff_data
 from load_blender import load_blender_data
+from run_nerf_helpers import load_dataset, load_args
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 np.random.seed(0)
@@ -209,7 +210,7 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples, perturb=0.,
 
     return rgb_map, rgb_map_0
 
-def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True, near=0., far=1., **kwargs):
+def render(H, W, K, rays, chunk=1024*32, ndc=True, near=0., far=1., **kwargs):
     """Render rays
     Args:
       H: int. Height of image in pixels.
@@ -217,7 +218,6 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True, near=0., far=1
       focal: float. Focal length of pinhole camera.
       chunk: int. Maximum number of rays to process simultaneously. Used to control maximum memory usage. Does not affect final results.
       rays: array of shape [2, batch_size, 3]. Ray origin and direction for each example in batch.
-      c2w: array of shape [3, 4]. Camera-to-world transformation matrix.
       ndc: bool. If True, represent ray origin, direction in NDC coordinates.
       near: float or array of shape [batch_size]. Nearest distance for a ray.
       far: float or array of shape [batch_size]. Farthest distance for a ray.
@@ -225,12 +225,9 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True, near=0., far=1
       rgb_map: [batch_size, 3]. Predicted RGB values for rays.
       rgb_map_0 [batch_size, 3]: See rgb_map. Output for coarse model.
     """
-    if c2w is not None:
-        rays_o, rays_d = get_rays(H, W, K, c2w)  # special case to render full image
-    else:
-        rays_o, rays_d = rays  # use provided ray batch
 
     # provide ray directions as input
+    rays_o, rays_d = rays
     viewdirs = rays_d
     viewdirs = viewdirs / torch.norm(viewdirs, dim=-1, keepdim=True)
     viewdirs = torch.reshape(viewdirs, [-1,3]).float()
@@ -252,75 +249,8 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True, near=0., far=1
     return all_ret
 
 
-def config_parser(argv=sys.argv):
-    parser = configargparse.ArgumentParser()
-    parser.add_argument('--config', is_config_file=True, help='config file path')
-    parser.add_argument("--expname", type=str, help='experiment name')
-    parser.add_argument("--basedir", type=str, default='./logs/', help='where to store ckpts and logs')
-    parser.add_argument("--datadir", type=str, default='./data/llff/fern', help='input data directory')
-
-    # training options
-    parser.add_argument("--netdepth", type=int, default=8, help='layers in network')
-    parser.add_argument("--netwidth", type=int, default=256, help='channels per layer')
-    parser.add_argument("--netdepth_fine", type=int, default=8, help='layers in fine network')
-    parser.add_argument("--netwidth_fine", type=int, default=256, help='channels per layer in fine network')
-    parser.add_argument("--N_rand", type=int, default=32*32*4, help='batch size (number of random rays per gradient step)')
-    parser.add_argument("--lrate", type=float, default=5e-4, help='learning rate')
-    parser.add_argument("--lrate_decay", type=int, default=250, help='exponential learning rate decay (in 1000 steps)')
-    parser.add_argument("--chunk", type=int, default=1024*32, help='number of rays processed in parallel, decrease if running out of memory')
-    parser.add_argument("--netchunk", type=int, default=1024*64, help='number of pts sent through network in parallel, decrease if running out of memory')
-    parser.add_argument("--perturb", type=float, default=1., help='set to 0. for no jitter, 1. for jitter')
-
-    # rendering options
-    parser.add_argument("--N_iters", type=int, default=200000, help='number of iterations to train')
-    parser.add_argument("--N_samples", type=int, default=64, help='number of coarse samples per ray')
-    parser.add_argument("--N_importance", type=int, default=64, help='number of additional fine samples per ray')
-    parser.add_argument("--multires", type=int, default=10, help='log2 of max freq for positional encoding (3D location)')
-    parser.add_argument("--multires_views", type=int, default=4, help='log2 of max freq for positional encoding (2D direction)')
-    parser.add_argument("--raw_noise_std", type=float, default=0., help='std dev of noise added to regularize sigma_a output, 1e0 recommended')
-
-    # dataset options
-    parser.add_argument("--dataset_type", type=str, default='llff', help='options: llff / blender')
-    parser.add_argument("--testskip", type=int, default=8, help='will load 1/N images from test/val sets')
-
-    ## blender flags
-    parser.add_argument("--white_bkgd", action='store_true', help='set to render synthetic data on a white bkgd (always use for dvoxels)')
-    parser.add_argument("--half_res", action='store_true', help='load blender synthetic data at 400x400 instead of 800x800')
-
-    ## llff flags
-    parser.add_argument("--factor", type=int, default=8, help='downsample factor for LLFF images')
-    parser.add_argument("--spherify", action='store_true', help='set for spherical 360 scenes')
-
-    # logging/saving options
-    parser.add_argument("--i_print",   type=int, default=100, help='frequency of console printout and metric logging')
-    parser.add_argument("--i_weights", type=int, default=10000, help='frequency of weight ckpt saving')
-    parser.add_argument("--i_video",   type=int, default=50000, help='frequency of render_poses video saving')
-
-    return parser.parse_args(argv)
-
-
 def train(args):
-    # Load data
-    if args.dataset_type == 'llff':
-        images, poses, bds, render_poses, _ = load_llff_data(args.datadir, args.factor, recenter=True, bd_factor=.75, spherify=args.spherify)
-        H, W, focal = poses[0,:3,-1]
-        poses = poses[:,:3,:4]
-        i_test = np.arange(images.shape[0])[::args.testskip]
-        i_train = np.array([i for i in np.arange(int(images.shape[0])) if i not in i_test])
-        near, far = 0., 1.
-
-    elif args.dataset_type == 'blender':
-        images, poses, render_poses, hwf, i_split = load_blender_data(args.datadir, args.half_res, args.testskip)
-        i_train, _, _ = i_split
-        H, W, focal = hwf
-        near, far = 2., 6.
-        if args.white_bkgd:
-            images = images[...,:3]*images[...,-1:] + (1.-images[...,-1:])
-        else:
-            images = images[...,:3]
-
-    else:
-        raise ValueError(f'Unknown dataset type {args.dataset_type}, exiting')
+    images, poses, render_poses, H, W, focal, near, far, i_train = load_dataset(args)
 
     # Create output directory
     logdir = os.path.join(args.basedir, args.expname)
@@ -378,7 +308,7 @@ def train(args):
             i_batch = 0
 
         # Core optimization loop
-        rgb, rgb0 = render(H, W, K, chunk=args.chunk, rays=batch_rays, **render_kwargs_train)
+        rgb, rgb0 = render(H, W, K, batch_rays, chunk=args.chunk, **render_kwargs_train)
         optimizer.zero_grad()
         img_loss = img2mse(rgb, target_s)
         img_loss0 = img2mse(rgb0, target_s)
@@ -410,7 +340,8 @@ def train(args):
             rgbs = []
             for i, c2w in enumerate(tqdm(render_poses[:1])):
                 with torch.no_grad():
-                    rgb, _ = render(H, W, K, chunk=args.chunk, c2w=c2w[:3,:4], **render_kwargs_test)
+                    rays = get_rays(H, W, K, c2w[:3,:4])
+                    rgb, _ = render(H, W, K, rays, chunk=args.chunk, **render_kwargs_test)
                 rgbs.append(rgb.cpu().numpy())
             rgbs = np.stack(rgbs, 0)
             np.savez_compressed(os.path.join(logdir, f'{args.expname}_spiral_{i+1:06d}_rgb.npz'), to8b(rgbs))
@@ -420,4 +351,4 @@ def train(args):
 
 
 if __name__=='__main__':
-    train(config_parser())
+    train(load_args())
