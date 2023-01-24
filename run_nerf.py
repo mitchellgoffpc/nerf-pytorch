@@ -105,14 +105,14 @@ def sample_pdf(bins, weights, N_samples, det=False):
     # Take uniform samples
     if det:
         u = torch.linspace(0., 1., steps=N_samples)
-        u = u.expand(list(cdf.shape[:-1]) + [N_samples]).contiguous()
+        u = u.expand([*cdf.shape[:-1], N_samples]).contiguous()
     else:
-        u = torch.rand(list(cdf.shape[:-1]) + [N_samples])
+        u = torch.rand([*cdf.shape[:-1], N_samples])
 
     # Invert CDF
     inds = torch.searchsorted(cdf, u, right=True)
-    below = torch.max(torch.zeros_like(inds-1), inds-1)
-    above = torch.min((cdf.shape[-1]-1) * torch.ones_like(inds), inds)
+    below = torch.maximum(torch.zeros_like(inds), inds-1)
+    above = torch.minimum(torch.full_like(inds, cdf.shape[-1]-1), inds)
     inds_g = torch.stack([below, above], -1)  # (batch, N_samples, 2)
 
     matched_shape = [inds_g.shape[0], inds_g.shape[1], cdf.shape[-1]]
@@ -126,7 +126,6 @@ def sample_pdf(bins, weights, N_samples, det=False):
 
 # Embed inputs and run network
 def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
-    """Prepares inputs and applies network 'fn'."""
     input_dirs = viewdirs[:,None].expand(inputs.shape)
     embedded = torch.cat([embed_fn(inputs), embeddirs_fn(input_dirs)], -1).flatten(end_dim=1)
     outputs_flat = torch.cat([fn(embedded[i:i+netchunk]) for i in range(0, embedded.shape[0], netchunk)], 0)

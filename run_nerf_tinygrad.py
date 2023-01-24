@@ -52,3 +52,61 @@ class NeRF:
 
         rgb = h.linear(**self.rgb_linear)
         return rgb.cat(alpha, dim=-1)
+
+
+# Ray helpers
+def get_rays(H, W, K, c2w):
+    i, j = np.meshgrid(np.linspace(0, W-1, W), np.linspace(0, H-1, H), indexing='xy')
+    dirs = np.stack([(i-K[0,2]) / K[0,0], -(j-K[1,2]) / K[1,1], -np.ones_like(i)], -1)
+    # Rotate ray directions from camera frame to the world frame
+    rays_d = np.sum(dirs[..., np.newaxis, :] * c2w[:3,:3], -1)  # dot product, equals to: [c2w.dot(dir) for dir in dirs]
+    # Translate camera frame's origin to the world frame. It is the origin of all rays.
+    rays_o = np.broadcast_to(c2w[:3,-1], rays_d.shape)
+    return np.stack([rays_o, rays_d], 0)
+
+def ndc_rays(H, W, focal, near, rays_o, rays_d):
+    # Shift ray origins to near plane
+    t = -(near + rays_o[...,2]) / rays_d[...,2]
+    rays_o = rays_o + t[...,None] * rays_d
+
+    # Projection
+    o0 = -1./(W/(2.*focal)) * rays_o[...,0] / rays_o[...,2]
+    o1 = -1./(H/(2.*focal)) * rays_o[...,1] / rays_o[...,2]
+    o2 = 1. + 2. * near / rays_o[...,2]
+
+    d0 = -1./(W/(2.*focal)) * (rays_d[...,0]/rays_d[...,2] - rays_o[...,0]/rays_o[...,2])
+    d1 = -1./(H/(2.*focal)) * (rays_d[...,1]/rays_d[...,2] - rays_o[...,1]/rays_o[...,2])
+    d2 = -2. * near / rays_o[...,2]
+
+    return np.stack([o0,o1,o2], -1), np.stack([d0,d1,d2], -1)
+
+# Hierarchical sampling (section 5.2)
+def sample_pdf(bins, weights, N_samples, det=False):
+    # Get pdf
+    weights = weights + 1e-5 # prevent nans
+    pdf = weights / np.sum(weights, axis=-1, keepdims=True)
+    cdf = np.cumsum(pdf, -1)
+    cdf = np.concatenate([np.zeros_like(cdf[...,:1]), cdf], -1)  # (batch, len(bins))
+
+    # Take uniform samples
+    if det:
+        u = np.linspace(0., 1., N_samples)
+        u = np.broadcast_to(u, [*cdf.shape[:-1], N_samples])
+        u = np.ascontiguousarray(u)
+    else:
+        u = np.random.uniform(size=[*cdf.shape[:-1], N_samples])
+
+    # Invert CDF
+    inds = np.stack([np.searchsorted(cdf[i], u[i], side='right') for i in range(len(bins))], axis=0)
+    below = np.maximum(np.zeros_like(inds), inds-1)
+    above = np.minimum(np.full_like(inds, cdf.shape[-1]-1), inds)
+    inds_g = np.stack([below, above], -1)  # (batch, N_samples, 2)
+
+    matched_shape = [inds_g.shape[0], inds_g.shape[1], cdf.shape[-1]]
+    cdf_g = np.take_along_axis(np.broadcast_to(cdf[:,None], matched_shape), inds_g, axis=2)
+    bins_g = np.take_along_axis(np.broadcast_to(bins[:,None], matched_shape), inds_g, axis=2)
+
+    denom = (cdf_g[...,1]-cdf_g[...,0])
+    denom = np.where(denom<1e-5, np.ones_like(denom), denom)
+    t = (u-cdf_g[...,0])/denom
+    return bins_g[...,0] + t * (bins_g[...,1]-bins_g[...,0])
