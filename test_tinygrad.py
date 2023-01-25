@@ -3,6 +3,17 @@ import numpy as np
 import torch
 from tinygrad.tensor import Tensor
 
+# Copy weights from the torch model into the tinygrad model
+def copy_weights(torch_nerf, tiny_nerf):
+    for k,v in torch_nerf._modules.items():
+        if isinstance(v, torch.nn.ModuleList):
+            for i, (_,x) in enumerate(v._modules.items()):
+                tiny_nerf.__dict__[k][i]['weight'] = Tensor(x.weight.data.numpy().T)
+                tiny_nerf.__dict__[k][i]['bias'] = Tensor(x.bias.data.numpy().T)
+        else:
+            tiny_nerf.__dict__[k]['weight'] = Tensor(v.weight.data.numpy().T)
+            tiny_nerf.__dict__[k]['bias'] = Tensor(v.bias.data.numpy().T)
+
 
 class TestEmbedder(unittest.TestCase):
     def test_embedder(self):
@@ -24,17 +35,7 @@ class TestModel(unittest.TestCase):
         torch.manual_seed(42)
         torch_nerf = TorchNeRF()
         tiny_nerf = TinyNeRF()
-
-        # Copy the weights
-        for k,v in torch_nerf._modules.items():
-            if isinstance(v, torch.nn.ModuleList):
-                for i, (_,x) in enumerate(v._modules.items()):
-                    tiny_nerf.__dict__[k][i]['weight'] = Tensor(x.weight.data.numpy().T)
-                    tiny_nerf.__dict__[k][i]['bias'] = Tensor(x.bias.data.numpy().T)
-            else:
-                tiny_nerf.__dict__[k]['weight'] = Tensor(v.weight.data.numpy().T)
-                tiny_nerf.__dict__[k]['bias'] = Tensor(v.bias.data.numpy().T)
-
+        copy_weights(torch_nerf, tiny_nerf)
         data = np.random.normal(0, 1, size=(32, 6)).astype(np.float32)
         torch_result = torch_nerf(torch.as_tensor(data)).detach().numpy()
         tiny_result = tiny_nerf(Tensor(data)).numpy()
@@ -74,6 +75,18 @@ class TestRayHelpers(unittest.TestCase):
         torch_result = sample_pdf_torch(torch.as_tensor(bins), torch.as_tensor(weights), N_samples, det=True)
         tiny_result = sample_pdf_tiny(bins, weights, N_samples, det=True)
         np.testing.assert_allclose(torch_result, tiny_result, atol=3e-5)
+
+class TestRendering(unittest.TestCase):
+    def test_raw2outputs(self):
+        from run_nerf import raw2outputs as raw2outs_torch
+        from run_nerf_tinygrad import raw2outputs as raw2outs_tiny
+        raw = np.random.uniform(size=(1024, 64, 4))
+        z_vals = np.random.uniform(size=(1024, 64))
+        rays_d = np.random.uniform(size=(1024, 3))
+        torch_rgb, torch_weights = raw2outs_torch(torch.as_tensor(raw), torch.as_tensor(z_vals), torch.as_tensor(rays_d))
+        tiny_rgb, tiny_weights = raw2outs_tiny(raw, z_vals, rays_d)
+        np.testing.assert_allclose(torch_rgb, tiny_rgb, atol=1e-7)
+        np.testing.assert_allclose(torch_weights, tiny_weights, atol=1e-7)
 
 
 if __name__ == '__main__':

@@ -180,7 +180,7 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples, perturb=0.,
     """
     assert ray_batch.shape[-1] == 11
     N_rays = ray_batch.shape[0]
-    rays_o, rays_d, near, far, viewdirs = ray_batch[:,0:3], ray_batch[:,3:6], ray_batch[:,6:7], ray_batch[:,7:8], ray_batch[:,8:11] # [N_rays, 3] each
+    rays_o, rays_d, near, far, viewdirs = ray_batch[:,0:3], ray_batch[:,3:6], ray_batch[:,6:7], ray_batch[:,7:8], ray_batch[:,8:11]
 
     t_vals = torch.linspace(0., 1., steps=N_samples)
     z_vals = near * (1.-t_vals) + far * (t_vals)
