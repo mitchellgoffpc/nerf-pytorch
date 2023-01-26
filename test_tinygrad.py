@@ -33,12 +33,13 @@ class TestModel(unittest.TestCase):
         from run_nerf_tinygrad import NeRF as TinyNeRF
         np.random.seed(42)
         torch.manual_seed(42)
-        torch_nerf = TorchNeRF()
-        tiny_nerf = TinyNeRF()
+        torch_nerf = TorchNeRF(D=8, W=256, num_freqs=10, num_freqs_views=4)
+        tiny_nerf = TinyNeRF(D=8, W=256, num_freqs=10, num_freqs_views=4)
         copy_weights(torch_nerf, tiny_nerf)
-        data = np.random.normal(0, 1, size=(32, 6)).astype(np.float32)
-        torch_result = torch_nerf(torch.as_tensor(data)).detach().numpy()
-        tiny_result = tiny_nerf(Tensor(data)).numpy()
+        pts = np.random.normal(0, 1, size=(32, 16, 3)).astype(np.float32)
+        views = np.random.normal(0, 1, size=(32, 3)).astype(np.float32)
+        torch_result = torch_nerf(torch.as_tensor(pts), torch.as_tensor(views)).detach().numpy()
+        tiny_result = tiny_nerf(pts, views).numpy()
         np.testing.assert_allclose(torch_result, tiny_result, atol=1e-7)
 
 class TestRayHelpers(unittest.TestCase):

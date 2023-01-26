@@ -21,37 +21,42 @@ class Embedder:
 
 # Model
 class NeRF:
-    def __init__(self, D=8, W=256, input_ch=3, input_ch_views=3):
+    def __init__(self, D, W, num_freqs, num_freqs_views):
         super().__init__()
         self.D = D
         self.W = W
-        self.input_ch = input_ch
-        self.input_ch_views = input_ch_views
         self.skips = [4]
+        self.embedder = Embedder(num_freqs)
+        self.embedder_views = Embedder(num_freqs_views)
 
-        self.pts_linears = [linear(input_ch, W)] + [linear(W + (input_ch if i in self.skips else 0), W) for i in range(D-1)]
-        self.views_linears = [linear(input_ch_views + W, W//2)]
+        self.pts_linears = [linear(self.embedder.out_dim, W)] + [linear(W + self.embedder.out_dim if i in self.skips else W, W) for i in range(D-1)]
+        self.views_linears = [linear(self.embedder_views.out_dim + W, W//2)]
         self.feature_linear = linear(W, W)
         self.alpha_linear = linear(W, 1)
         self.rgb_linear = linear(W//2, 3)
 
-    def __call__(self, x):
-        input_pts, input_views = x[:, :self.input_ch], x[:, self.input_ch:]
-        h = input_pts
+    def __call__(self, input_pts, input_views):
+        embedded_pts = Tensor(self.embedder(input_pts))
+        embedded_views = Tensor(self.embedder_views(input_views[:,None])).expand(*embedded_pts.shape[:-1], -1)
+        embedded_pts = embedded_pts.reshape(-1, embedded_pts.shape[-1])
+        embedded_views = embedded_views.reshape(-1, embedded_views.shape[-1])
+
+        h = embedded_pts
         for i, l in enumerate(self.pts_linears):
             h = h.linear(**self.pts_linears[i]).relu()
             if i in self.skips:
-                h = input_pts.cat(h, dim=-1)
+                h = embedded_pts.cat(h, dim=-1)
 
         alpha = h.linear(**self.alpha_linear)
         feature = h.linear(**self.feature_linear)
-        h = feature.cat(input_views, dim=-1)
+        h = feature.cat(embedded_views, dim=-1)
 
         for i, l in enumerate(self.views_linears):
             h = h.linear(**self.views_linears[i]).relu()
 
         rgb = h.linear(**self.rgb_linear)
-        return rgb.cat(alpha, dim=-1)
+        rgba = rgb.cat(alpha, dim=-1)
+        return rgba.reshape(*input_pts.shape[:-1], rgba.shape[-1])
 
 
 # Ray helpers
