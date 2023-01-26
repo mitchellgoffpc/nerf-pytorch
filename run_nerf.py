@@ -5,7 +5,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import configargparse
 from tqdm import tqdm, trange
-from functools import partial
 from load_llff import load_llff_data
 from load_blender import load_blender_data
 from run_nerf_helpers import load_dataset, load_args
@@ -35,40 +34,47 @@ class Embedder:
 
 # Model
 class NeRF(nn.Module):
-    def __init__(self, D=8, W=256, input_ch=3, input_ch_views=3):
+    def __init__(self, D, W, num_freqs, num_freqs_views):
         super().__init__()
         self.D = D
         self.W = W
-        self.input_ch = input_ch
-        self.input_ch_views = input_ch_views
         self.skips = [4]
+        self.embedder = Embedder(num_freqs)
+        self.embedder_views = Embedder(num_freqs_views)
 
-        self.pts_linears = nn.ModuleList([nn.Linear(input_ch, W)] + [nn.Linear(W + (input_ch if i in self.skips else 0), W) for i in range(D-1)])
-        self.views_linears = nn.ModuleList([nn.Linear(input_ch_views + W, W//2)])
+        self.pts_linears = nn.ModuleList(
+          [nn.Linear(self.embedder.out_dim, W)] +
+          [nn.Linear(W + self.embedder.out_dim if i in self.skips else W, W) for i in range(D-1)])
+        self.views_linears = nn.ModuleList([nn.Linear(self.embedder_views.out_dim + W, W//2)])
         self.feature_linear = nn.Linear(W, W)
         self.alpha_linear = nn.Linear(W, 1)
         self.rgb_linear = nn.Linear(W//2, 3)
 
-    def forward(self, x):
-        input_pts, input_views = torch.split(x, [self.input_ch, self.input_ch_views], dim=-1)
-        h = input_pts
+    def forward(self, input_pts, input_views):
+        embedded_pts = self.embedder(input_pts)
+        embedded_views = self.embedder_views(input_views[:,None]).expand(*embedded_pts.shape[:-1], -1)
+        embedded_pts, embedded_views = embedded_pts.flatten(end_dim=-2), embedded_views.flatten(end_dim=-2)
+
+        h = embedded_pts
         for i, l in enumerate(self.pts_linears):
             h = F.relu(self.pts_linears[i](h))
             if i in self.skips:
-                h = torch.cat([input_pts, h], -1)
+                h = torch.cat([embedded_pts, h], -1)
 
         alpha = self.alpha_linear(h)
         feature = self.feature_linear(h)
-        h = torch.cat([feature, input_views], -1)
+        h = torch.cat([feature, embedded_views], -1)
 
         for i, l in enumerate(self.views_linears):
             h = F.relu(self.views_linears[i](h))
 
         rgb = self.rgb_linear(h)
-        return torch.cat([rgb, alpha], -1)
+        rgba = torch.cat([rgb, alpha], -1)
+        return rgba.view(*input_pts.shape[:-1], rgba.shape[-1])
 
 
 # Ray helpers
+
 def get_rays(H, W, K, c2w):
     i, j = torch.meshgrid(torch.linspace(0, W-1, W), torch.linspace(0, H-1, H), indexing='xy')
     dirs = torch.stack([(i-K[0,2]) / K[0,0], -(j-K[1,2]) / K[1,1], -torch.ones_like(i)], -1)
@@ -124,14 +130,9 @@ def sample_pdf(bins, weights, N_samples, det=False):
     t = (u-cdf_g[...,0])/denom
     return bins_g[...,0] + t * (bins_g[...,1]-bins_g[...,0])
 
-# Embed inputs and run network
-def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
-    input_dirs = viewdirs[:,None].expand(inputs.shape)
-    embedded = torch.cat([embed_fn(inputs), embeddirs_fn(input_dirs)], -1).flatten(end_dim=1)
-    outputs_flat = torch.cat([fn(embedded[i:i+netchunk]) for i in range(0, embedded.shape[0], netchunk)], 0)
-    return outputs_flat.view(*inputs.shape[:-1], outputs_flat.shape[-1])
 
-# Convert network outputs to rgb
+# Rendering
+
 def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False):
     """Transforms model's predictions to semantically meaningful values.
     Args:
@@ -158,20 +159,18 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False):
 
     return rgb_map, weights
 
-
-def render_rays(ray_batch, network_fn, network_query_fn, N_samples, perturb=0.,
-                N_importance=0, network_fine=None, white_bkgd=False, raw_noise_std=0.):
+def render_rays(ray_batch, network_course, network_fine, N_samples, perturb=0.,
+                N_importance=0, white_bkgd=False, raw_noise_std=0.):
     """Volumetric rendering.
     Args:
       ray_batch: array of shape [batch_size, ...]. All information necessary
         for sampling along a ray, including: ray origin, ray direction, min
         dist, max dist, and unit-magnitude viewing direction.
-      network_fn: function. Model for predicting RGB and density at each point in space.
-      network_query_fn: function used for passing queries to network_fn.
+      network_course: Model for predicting RGB and density at each point in space.
+      network_fine: "fine" network with same spec as network_course.
       N_samples: int. Number of different times to sample along each ray.
       perturb: float, 0 or 1. If non-zero, each ray is sampled at stratified random points in time.
       N_importance: int. Number of additional times to sample along each ray. These samples are only passed to network_fine.
-      network_fine: "fine" network with same spec as network_fn.
       white_bkgd: bool. If True, assume a white background.
       raw_noise_std: ...
     Returns:
@@ -195,7 +194,7 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples, perturb=0.,
 
     # course sample
     pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples, 3]
-    raw = network_query_fn(pts, viewdirs, network_fn)
+    raw = network_course(pts, viewdirs)
     rgb_map_0, weights = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd)
 
     # fine sample
@@ -204,7 +203,7 @@ def render_rays(ray_batch, network_fn, network_query_fn, N_samples, perturb=0.,
     z_vals, _ = torch.sort(torch.cat([z_vals, z_samples], -1), -1)
 
     pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples + N_importance, 3]
-    raw = network_query_fn(pts, viewdirs, network_fine)
+    raw = network_fine(pts, viewdirs)
     rgb_map, weights = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd)
 
     return rgb_map, rgb_map_0
@@ -248,6 +247,8 @@ def render(H, W, K, rays, chunk=1024*32, ndc=True, near=0., far=1., **kwargs):
     return all_ret
 
 
+# Training
+
 def train(args):
     images, poses, render_poses, H, W, focal, near, far, i_train = load_dataset(args)
 
@@ -264,13 +265,12 @@ def train(args):
     # Create nerf model
     embed_fn = Embedder(args.multires)
     embeddirs_fn = Embedder(args.multires_views)
-    model = NeRF(args.netdepth, args.netwidth, embed_fn.out_dim, embeddirs_fn.out_dim).to(device)
-    model_fine = NeRF(args.netdepth_fine, args.netwidth_fine, embed_fn.out_dim, embeddirs_fn.out_dim).to(device)
-    network_query_fn = partial(run_network, embed_fn=embed_fn, embeddirs_fn=embeddirs_fn, netchunk=args.netchunk)
-    optimizer = torch.optim.Adam(params=(*model.parameters(), *model_fine.parameters()), lr=args.lrate, betas=(0.9, 0.999))
+    model_course = NeRF(args.netdepth, args.netwidth, args.multires, args.multires_views).to(device)
+    model_fine = NeRF(args.netdepth_fine, args.netwidth_fine, args.multires, args.multires_views).to(device)
+    optimizer = torch.optim.Adam(params=(*model_course.parameters(), *model_fine.parameters()), lr=args.lrate, betas=(0.9, 0.999))
 
     render_kwargs_train = {
-        'network_query_fn' : network_query_fn, 'network_fn' : model, 'network_fine' : model_fine,
+        'network_course' : model_course, 'network_fine' : model_fine,
         'perturb': args.perturb, 'N_importance' : args.N_importance, 'N_samples' : args.N_samples,
         'white_bkgd' : args.white_bkgd, 'raw_noise_std' : args.raw_noise_std, 'ndc': args.dataset_type == 'llff',
         'near': near, 'far': far}
@@ -329,7 +329,7 @@ def train(args):
             path = os.path.join(logdir, f'{i+1:06d}.ckpt')
             torch.save({
                 'global_step': i,
-                'network_fn_state_dict': render_kwargs_train['network_fn'].state_dict(),
+                'network_fn_state_dict': render_kwargs_train['network_course'].state_dict(),
                 'network_fine_state_dict': render_kwargs_train['network_fine'].state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
             }, path)
