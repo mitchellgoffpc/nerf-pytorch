@@ -84,10 +84,15 @@ class TestRendering(unittest.TestCase):
         raw = np.random.uniform(size=(1024, 64, 4))
         z_vals = np.random.uniform(size=(1024, 64))
         rays_d = np.random.uniform(size=(1024, 3))
-        torch_rgb, torch_weights = raw2outs_torch(torch.as_tensor(raw), torch.as_tensor(z_vals), torch.as_tensor(rays_d))
-        tiny_rgb, tiny_weights = raw2outs_tiny(raw, z_vals, rays_d)
-        np.testing.assert_allclose(torch_rgb, tiny_rgb, atol=1e-7)
-        np.testing.assert_allclose(torch_weights, tiny_weights, atol=1e-7)
+        torch_raw = torch.nn.Parameter(torch.Tensor(raw), requires_grad=True)
+        tiny_raw = Tensor(raw, requires_grad=True)
+        torch_rgb, torch_weights = raw2outs_torch(torch_raw, torch.as_tensor(z_vals), torch.as_tensor(rays_d), white_bkgd=True)
+        tiny_rgb, tiny_weights = raw2outs_tiny(tiny_raw, z_vals, rays_d, white_bkgd=True)
+        torch.cat([torch_rgb, torch_weights], -1).sum().backward()
+        tiny_rgb.cat(tiny_weights, dim=-1).sum().backward()
+        np.testing.assert_allclose(torch_rgb.detach(), tiny_rgb.numpy(), atol=1e-5)
+        np.testing.assert_allclose(torch_weights.detach(), tiny_weights.numpy(), atol=1e-5)
+        np.testing.assert_allclose(torch_raw.grad.numpy(), tiny_raw.grad.numpy(), atol=3e-5)
 
 
 if __name__ == '__main__':

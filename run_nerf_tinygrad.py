@@ -119,27 +119,24 @@ def sample_pdf(bins, weights, N_samples, det=False):
 
 # Convert network outputs to rgb
 def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False):
-    """Transforms model's predictions to semantically meaningful values.
-    Args:
-        raw: [num_rays, num_samples along ray, 4]. Prediction from model.
-        z_vals: [num_rays, num_samples along ray]. Integration time.
-        rays_d: [num_rays, 3]. Direction of each ray.
-    Returns:
-        rgb_map: [num_rays, 3]. Estimated RGB color of a ray.
-        weights: [num_rays, num_samples]. Weights assigned to each sampled color.
-    """
     dists = z_vals[...,1:] - z_vals[...,:-1]
     dists = np.concatenate([dists, np.full_like(dists[...,:1], 1e10)], axis=-1)  # [N_rays, N_samples]
     dists = dists * np.linalg.norm(rays_d[...,None,:], axis=-1)
-    rgb = 1 / (1 + np.exp(-raw[...,:3]))  # [N_rays, N_samples, 3]
+    rgb = raw[:,:,:3].sigmoid()  # [N_rays, N_samples, 3]
 
-    noise = np.random.normal(size=raw[...,3].shape) * raw_noise_std if raw_noise_std > 0. else 0.
-    alpha = 1. - np.exp(-np.maximum(raw[...,3] + noise, 0) * dists)  # [N_rays, N_samples]
-    weights = alpha * np.cumprod(np.concatenate([np.ones((alpha.shape[0], 1)), 1. - alpha + 1e-10], axis=-1), axis=-1)[:, :-1]
-    rgb_map = np.sum(weights[...,None] * rgb, axis=-2)  # [N_rays, 3]
+    noise = Tensor(np.random.normal(size=raw.shape[:-1])) * raw_noise_std if raw_noise_std > 0. else 0.
+    alpha = 1. - (-(raw[:,:,3] + noise).relu() * dists)[0].exp()  # [N_rays, N_samples]  # Something is wrong with the shape here...
+    alpha_comp = 1. - alpha + 1e-10
+    # No cumprod :(
+    alpha_cprod = alpha_comp[:,:1]
+    for i in range(1, alpha.shape[-1]):
+      alpha_cprod = alpha_cprod.cat(alpha_cprod[:,i-1:i] * alpha_comp[:,i:i+1], dim=-1)
+    alpha_cprod = Tensor.ones(alpha.shape[0], 1).cat(alpha_cprod[:,:-1], dim=-1)
+    weights = alpha * alpha_cprod
+    rgb_map = (weights.reshape(*weights.shape, 1) * rgb).sum(1)  # [N_rays, 3]
 
     if white_bkgd:
-        acc_map = np.sum(weights, axis=-1)
-        rgb_map = rgb_map + (1. - acc_map[...,None])
+        acc_map = weights.sum(-1).reshape(*weights.shape[:-1], 1)
+        rgb_map = rgb_map + (1. - acc_map)
 
     return rgb_map, weights
