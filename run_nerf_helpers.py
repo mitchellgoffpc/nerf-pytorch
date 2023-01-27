@@ -47,7 +47,6 @@ def load_args(argv=sys.argv):
     parser.add_argument("--lrate_decay", type=int, default=250, help='exponential learning rate decay (in 1000 steps)')
     parser.add_argument("--chunk", type=int, default=1024*32, help='number of rays processed in parallel, decrease if running out of memory')
     parser.add_argument("--netchunk", type=int, default=1024*64, help='number of pts sent through network in parallel, decrease if running out of memory')
-    parser.add_argument("--perturb", type=float, default=1., help='set to 0. for no jitter, 1. for jitter')
 
     # rendering options
     parser.add_argument("--N_iters", type=int, default=200000, help='number of iterations to train')

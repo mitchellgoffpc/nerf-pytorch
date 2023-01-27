@@ -159,8 +159,7 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False):
 
     return rgb_map, weights
 
-def render_rays(ray_batch, network_course, network_fine, N_samples, perturb=0.,
-                N_importance=0, white_bkgd=False, raw_noise_std=0.):
+def render_rays(ray_batch, network_course, network_fine, N_samples, N_importance, perturb, raw_noise_std, white_bkgd=False):
     """Volumetric rendering.
     Args:
       ray_batch: array of shape [batch_size, ...]. All information necessary
@@ -169,7 +168,7 @@ def render_rays(ray_batch, network_course, network_fine, N_samples, perturb=0.,
       network_course: Model for predicting RGB and density at each point in space.
       network_fine: "fine" network with same spec as network_course.
       N_samples: int. Number of different times to sample along each ray.
-      perturb: float, 0 or 1. If non-zero, each ray is sampled at stratified random points in time.
+      perturb: bool. If True, each ray is sampled at stratified random points in time.
       N_importance: int. Number of additional times to sample along each ray. These samples are only passed to network_fine.
       white_bkgd: bool. If True, assume a white background.
       raw_noise_std: ...
@@ -186,7 +185,7 @@ def render_rays(ray_batch, network_course, network_fine, N_samples, perturb=0.,
     z_vals = z_vals.expand([N_rays, N_samples])
 
     # get intervals between samples
-    if perturb > 0.:
+    if perturb:
         mids = .5 * (z_vals[...,1:] + z_vals[...,:-1])
         upper = torch.cat([mids, z_vals[...,-1:]], -1)
         lower = torch.cat([z_vals[...,:1], mids], -1)
@@ -199,7 +198,7 @@ def render_rays(ray_batch, network_course, network_fine, N_samples, perturb=0.,
 
     # fine sample
     z_vals_mid = .5 * (z_vals[...,1:] + z_vals[...,:-1])
-    z_samples = sample_pdf(z_vals_mid, weights[...,1:-1], N_importance, det=(perturb==0.)).detach()
+    z_samples = sample_pdf(z_vals_mid, weights[...,1:-1], N_importance, det=not perturb).detach()
     z_vals, _ = torch.sort(torch.cat([z_vals, z_samples], -1), -1)
 
     pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples + N_importance, 3]
@@ -271,10 +270,10 @@ def train(args):
 
     render_kwargs_train = {
         'network_course' : model_course, 'network_fine' : model_fine,
-        'perturb': args.perturb, 'N_importance' : args.N_importance, 'N_samples' : args.N_samples,
+        'N_importance' : args.N_importance, 'N_samples' : args.N_samples,
         'white_bkgd' : args.white_bkgd, 'raw_noise_std' : args.raw_noise_std, 'ndc': args.dataset_type == 'llff',
-        'near': near, 'far': far}
-    render_kwargs_test = {**render_kwargs_train, 'perturb': False, 'raw_noise_std': 0.}
+        'near': near, 'far': far, 'perturb': True}
+    render_kwargs_test = {**render_kwargs_train, 'no_perturb': True, 'raw_noise_std': 0.}
 
     # Prepare raybatch tensor
     N_rand = args.N_rand
