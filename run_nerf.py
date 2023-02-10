@@ -34,7 +34,7 @@ class Embedder:
 
 # Model
 class NeRF(nn.Module):
-    def __init__(self, D, W, num_freqs, num_freqs_views):
+    def __init__(self, D=8, W=256, num_freqs=10, num_freqs_views=4):
         super().__init__()
         self.D = D
         self.W = W

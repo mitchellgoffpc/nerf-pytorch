@@ -2,7 +2,7 @@ import numpy as np
 from tinygrad.tensor import Tensor
 
 def linear(in_feats, out_feats):
-  return {"weight": Tensor.uniform(in_feats, out_feats), "bias": Tensor.zeros(out_feats)}
+  return {"weight": Tensor.uniform(in_feats, out_feats, requires_grad=True), "bias": Tensor.zeros(out_feats, requires_grad=True)}
 
 # Positional encoding (section 5.1)
 class Embedder:
@@ -21,7 +21,7 @@ class Embedder:
 
 # Model
 class NeRF:
-    def __init__(self, D, W, num_freqs, num_freqs_views):
+    def __init__(self, D=8, W=256, num_freqs=10, num_freqs_views=4):
         super().__init__()
         self.D = D
         self.W = W
@@ -140,3 +140,36 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False):
         rgb_map = rgb_map + (1. - acc_map)
 
     return rgb_map, weights
+
+# Volumetric rendering
+def render_rays(ray_batch, network_course, network_fine, N_samples, N_importance, perturb, raw_noise_std, white_bkgd=False):
+    assert ray_batch.shape[-1] == 11
+    N_rays = ray_batch.shape[0]
+    rays_o, rays_d, near, far, viewdirs = ray_batch[:,0:3], ray_batch[:,3:6], ray_batch[:,6:7], ray_batch[:,7:8], ray_batch[:,8:11]
+
+    t_vals = np.linspace(0., 1., num=N_samples)
+    z_vals = near * (1.-t_vals) + far * (t_vals)
+    z_vals = np.broadcast_to(z_vals, [N_rays, N_samples])
+
+    # get intervals between samples
+    if perturb:
+        mids = .5 * (z_vals[...,1:] + z_vals[...,:-1])
+        upper = np.concatenate([mids, z_vals[...,-1:]], -1)
+        lower = np.concatenate([z_vals[...,:1], mids], -1)
+        z_vals = lower + (upper - lower) * np.random.uniform(size=z_vals.shape) # stratified samples in those intervals
+
+    # course sample
+    pts = rays_o[:,None,:] + rays_d[:,None,:] * z_vals[:,:,None] # [N_rays, N_samples, 3]
+    raw = network_course(pts, viewdirs)
+    rgb_map_0, weights = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd)
+
+    # fine sample
+    z_vals_mid = .5 * (z_vals[:,1:] + z_vals[:,:-1])
+    z_samples = sample_pdf(z_vals_mid, weights[:,1:-1].numpy(), N_importance, det=not perturb)
+    z_vals = np.sort(np.concatenate([z_vals, z_samples], -1), -1)
+
+    pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples + N_importance, 3]
+    raw = network_fine(pts, viewdirs)
+    rgb_map, weights = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd)
+
+    return rgb_map, rgb_map_0
