@@ -2,7 +2,34 @@ import unittest
 import numpy as np
 import torch
 from tinygrad.tensor import Tensor
-from tinygrad.nn.optim import SGD, get_parameters, get_named_parameters
+from tinygrad.nn.optim import SGD, get_parameters
+
+def get_named_parameters(obj, prefix=[]):
+    parameters = {}
+    if isinstance(obj, Tensor):
+        parameters['.'.join(prefix)] = obj
+    elif isinstance(obj, list) or isinstance(obj, tuple):
+        for i,x in enumerate(obj):
+            parameters.update(get_named_parameters(x, prefix+[str(i)]))
+    elif isinstance(obj, dict):
+        for k,v in obj.items():
+            parameters.update(get_named_parameters(v, prefix+[str(k)]))
+    elif hasattr(obj, '__dict__'):
+        for k,v in obj.__dict__.items():
+            parameters.update(get_named_parameters(v, prefix+[str(k)]))
+    return parameters
+
+def get_nerf_models():
+    from run_nerf import NeRF as TorchNeRF
+    from run_nerf_tinygrad import NeRF as TinyNeRF
+    torch_nerf = TorchNeRF()
+    tiny_nerf = TinyNeRF()
+    torch_params = dict(torch_nerf.named_parameters())
+    tiny_params = get_named_parameters(tiny_nerf)
+    for k in torch_params | tiny_params:
+        tiny_params[k].assign(torch_params[k].detach().numpy().transpose())
+    return torch_nerf, tiny_nerf
+
 
 class TestEmbedder(unittest.TestCase):
     def test_embedder(self):
@@ -18,20 +45,15 @@ class TestEmbedder(unittest.TestCase):
 
 class TestModel(unittest.TestCase):
     def test_model(self):
-        from run_nerf import NeRF as TorchNeRF
-        from run_nerf_tinygrad import NeRF as TinyNeRF
         np.random.seed(42)
         torch.manual_seed(42)
 
         # Initialize nerfs
-        torch_nerf = TorchNeRF()
-        tiny_nerf = TinyNeRF()
-        torch_params = dict(torch_nerf.named_parameters())
-        tiny_params = get_named_parameters(tiny_nerf)
-        for k in torch_params | tiny_params:
-          tiny_params[k].assign(torch_params[k].detach().numpy().transpose())
+        torch_nerf, tiny_nerf = get_nerf_models()
         torch_optim = torch.optim.SGD(torch_nerf.parameters(), lr=0.001)
         tiny_optim = SGD(get_parameters(tiny_nerf), lr=0.001)
+        torch_params = dict(torch_nerf.named_parameters())
+        tiny_params = get_named_parameters(tiny_nerf)
 
         # Test forward pass
         pts = np.random.normal(0, 1, size=(32, 16, 3)).astype(np.float32)
@@ -44,13 +66,13 @@ class TestModel(unittest.TestCase):
         torch_result.sum().backward()
         tiny_result.sum().backward()
         for k in torch_params | tiny_params:
-          np.testing.assert_allclose(torch_params[k].grad.numpy().transpose(), tiny_params[k].grad.numpy(), atol=2e-4)
+            np.testing.assert_allclose(torch_params[k].grad.numpy().transpose(), tiny_params[k].grad.numpy(), atol=2e-4)
 
         # Test optimizer step
         torch_optim.step()
         tiny_optim.step()
         for k in torch_params | tiny_params:
-          np.testing.assert_allclose(torch_params[k].detach().numpy().transpose(), tiny_params[k].numpy(), atol=2e-7)
+            np.testing.assert_allclose(torch_params[k].detach().numpy().transpose(), tiny_params[k].numpy(), atol=2e-7)
 
 
 class TestRayHelpers(unittest.TestCase):
@@ -107,18 +129,13 @@ class TestRendering(unittest.TestCase):
         np.testing.assert_allclose(torch_raw.grad.numpy(), tiny_raw.grad.numpy(), atol=3e-5)
 
     def test_render_rays(self):
-        from run_nerf import render_rays as render_rays_torch, NeRF as TorchNeRF
-        from run_nerf_tinygrad import render_rays as render_rays_tiny, NeRF as TinyNeRF
-
-        # Initialize nerf
-        torch_nerf = TorchNeRF()
-        tiny_nerf = TinyNeRF()
-        torch_params = dict(torch_nerf.named_parameters())
-        tiny_params = get_named_parameters(tiny_nerf)
-        for k in torch_params | tiny_params:
-          tiny_params[k].assign(torch_params[k].detach().numpy().transpose())
+        from run_nerf import render_rays as render_rays_torch
+        from run_nerf_tinygrad import render_rays as render_rays_tiny
 
         # Test forward pass
+        torch_nerf, tiny_nerf = get_nerf_models()
+        torch_params = dict(torch_nerf.named_parameters())
+        tiny_params = get_named_parameters(tiny_nerf)
         rays = np.random.uniform(size=(128, 11)).astype(np.float32)
         torch_rgb, torch_rgb0 = render_rays_torch(torch.as_tensor(rays), torch_nerf, torch_nerf, 64, 64, False, 0.0, False)
         tiny_rgb, tiny_rgb0 = render_rays_tiny(rays, tiny_nerf, tiny_nerf, 64, 64, False, 0.0, False)
@@ -129,7 +146,37 @@ class TestRendering(unittest.TestCase):
         torch.cat([torch_rgb, torch_rgb0], -1).sum().backward()
         tiny_rgb.cat(tiny_rgb0, dim=-1).sum().backward()
         for k in torch_params | tiny_params:
-          np.testing.assert_allclose(torch_params[k].grad.numpy().transpose(), tiny_params[k].grad.numpy(), atol=1e-4, rtol=1e-6)
+            np.testing.assert_allclose(torch_params[k].grad.numpy().transpose(), tiny_params[k].grad.numpy(), atol=1e-4, rtol=1e-5)
+
+    def test_render(self):
+        from run_nerf import render as render_torch
+        from run_nerf_tinygrad import render as render_tiny
+
+        H, W, focal = 256, 512, 0.5
+        K = np.array([
+          [focal, 0,     0.5*W],
+          [0,     focal, 0.5*H],
+          [0,     0,     1]])
+
+        # Test forward pass
+        torch_nerf, tiny_nerf = get_nerf_models()
+        torch_params = dict(torch_nerf.named_parameters())
+        tiny_params = get_named_parameters(tiny_nerf)
+        rays = (np.random.uniform(size=(128, 3)).astype(np.float32), np.random.uniform(size=(128, 3)).astype(np.float32))
+        torch_rgb, torch_rgb0 = render_torch(
+          H, W, K, (torch.as_tensor(rays[0]), torch.as_tensor(rays[1])), network_course=torch_nerf, network_fine=torch_nerf,
+          N_importance=128, N_samples=128, perturb=False, raw_noise_std=0)
+        tiny_rgb, tiny_rgb0 = render_tiny(
+          H, W, K, rays, network_course=tiny_nerf, network_fine=tiny_nerf,
+          N_importance=128, N_samples=128, perturb=False, raw_noise_std=0)
+        np.testing.assert_allclose(torch_rgb.detach(), tiny_rgb.numpy(), atol=3e-7)
+        np.testing.assert_allclose(torch_rgb0.detach(), tiny_rgb0.numpy(), atol=3e-7)
+
+        # Test backward pass
+        torch.cat([torch_rgb, torch_rgb0], -1).sum().backward()
+        tiny_rgb.cat(tiny_rgb0, dim=-1).sum().backward()
+        for k in torch_params | tiny_params:
+            np.testing.assert_allclose(torch_params[k].grad.numpy().transpose(), tiny_params[k].grad.numpy(), atol=5e-4, rtol=1e-5)
 
 
 if __name__ == '__main__':

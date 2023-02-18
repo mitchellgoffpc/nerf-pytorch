@@ -1,9 +1,8 @@
-import os, sys
+import os
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import configargparse
 from tqdm import tqdm, trange
 from load_llff import load_llff_data
 from load_blender import load_blender_data
@@ -348,5 +347,5 @@ def train(args):
             tqdm.write(f"[TRAIN] Iter: {i+1} Loss: {loss.item()}  PSNR: {psnr.item()}")
 
 
-if __name__=='__main__':
+if __name__ == '__main__':
     train(load_args())

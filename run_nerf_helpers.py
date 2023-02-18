@@ -30,7 +30,7 @@ def load_dataset(args):
     return images, poses, render_poses, H, W, focal, near, far, i_train
 
 
-def load_args(argv=sys.argv):
+def load_args(argv=sys.argv[1:]):
     parser = configargparse.ArgumentParser()
     parser.add_argument('--config', is_config_file=True, help='config file path')
     parser.add_argument("--expname", type=str, help='experiment name')

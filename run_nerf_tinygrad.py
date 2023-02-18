@@ -1,5 +1,19 @@
+import os
+import math
 import numpy as np
 from tinygrad.tensor import Tensor
+from tinygrad.nn.optim import Adam, get_parameters
+from tqdm import tqdm, trange
+from load_llff import load_llff_data
+from load_blender import load_blender_data
+from run_nerf_helpers import load_dataset, load_args
+
+np.random.seed(0)
+
+# Misc
+img2mse = lambda x, y: ((x - y) ** 2).mean()
+mse2psnr = lambda x: -10. * x.log() / math.log(10.)
+to8b = lambda x: (255*np.clip(x,0,1)).astype(np.uint8)
 
 def linear(in_feats, out_feats):
   return {"weight": Tensor.uniform(in_feats, out_feats, requires_grad=True), "bias": Tensor.zeros(out_feats, requires_grad=True)}
@@ -173,3 +187,124 @@ def render_rays(ray_batch, network_course, network_fine, N_samples, N_importance
     rgb_map, weights = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd)
 
     return rgb_map, rgb_map_0
+
+def render(H, W, K, rays, chunk=1024*32, ndc=True, near=0., far=1., **kwargs):
+    rays_o, rays_d = rays
+    viewdirs = rays_d / np.linalg.norm(rays_d, axis=-1, keepdims=True)
+    viewdirs = viewdirs.reshape(-1,3)
+
+    sh = rays_d.shape # [..., 3]
+    if ndc:
+        rays_o, rays_d = ndc_rays(H, W, K[0][0], 1., rays_o, rays_d)  # for forward facing scenes
+
+    # Create ray batch
+    rays_o = rays_o.reshape(-1,3)
+    rays_d = rays_d.reshape(-1,3)
+    near, far = near * np.ones_like(rays_d[...,:1]), far * np.ones_like(rays_d[...,:1])
+    rays = np.concatenate([rays_o, rays_d, near, far, viewdirs], -1)
+
+    # Render and reshape
+    all_ret = [render_rays(rays[i:i+chunk], **kwargs) for i in range(0, rays.shape[0], chunk)]
+    all_ret = [all_ret[0][j].cat(*[x[j] for x in all_ret[1:]], dim=0) for j in range(2)]
+    all_ret = [x.reshape([*sh[:-1], *x.shape[1:]]) for x in all_ret]
+    return all_ret
+
+
+# Training
+
+def train(args):
+    images, poses, render_poses, H, W, focal, near, far, i_train = load_dataset(args)
+    render_poses = render_poses.numpy()
+
+    # Create output directory
+    logdir = os.path.join(args.basedir, args.expname)
+    os.makedirs(logdir, exist_ok=True)
+
+    # Cast intrinsics to right types
+    H, W = int(H), int(W)
+    K = np.array([[focal, 0,     0.5*W],
+                  [0,     focal, 0.5*H],
+                  [0,     0,     1]])
+
+    # Create nerf model
+    embed_fn = Embedder(args.multires)
+    embeddirs_fn = Embedder(args.multires_views)
+    model_course = NeRF(args.netdepth, args.netwidth, args.multires, args.multires_views)
+    model_fine = NeRF(args.netdepth_fine, args.netwidth_fine, args.multires, args.multires_views)
+    optimizer = Adam([*get_parameters(model_course), *get_parameters(model_fine)], lr=args.lrate, b1=0.9, b2=0.999)
+
+    render_kwargs_train = {
+        'network_course' : model_course, 'network_fine' : model_fine,
+        'N_importance' : args.N_importance, 'N_samples' : args.N_samples,
+        'white_bkgd' : args.white_bkgd, 'raw_noise_std' : args.raw_noise_std, 'ndc': args.dataset_type == 'llff',
+        'near': near, 'far': far, 'perturb': True}
+    render_kwargs_test = {**render_kwargs_train, 'no_perturb': True, 'raw_noise_std': 0.}
+
+    # Prepare raybatch tensor
+    N_rand = args.N_rand
+    rays = np.stack([get_rays(H, W, K, p) for p in poses[:,:3,:4]], axis=0) # [N, ro+rd, H, W, 3]
+    rays_rgb = np.concatenate([rays, images[:,None]], 1) # [N, ro+rd+rgb, H, W, 3]
+    rays_rgb = np.transpose(rays_rgb, [0,2,3,1,4]) # [N, H, W, ro+rd+rgb, 3]
+    rays_rgb = np.stack([rays_rgb[i] for i in i_train], 0) # train images only
+    rays_rgb = np.reshape(rays_rgb, [-1,3,3]) # [(N-1)*H*W, ro+rd+rgb, 3]
+    rays_rgb = rays_rgb.astype(np.float32)
+    np.random.shuffle(rays_rgb)
+    i_batch = 0
+
+    for i in trange(args.N_iters):
+
+        # Sample random ray batch over all images
+        batch = rays_rgb[i_batch:i_batch+N_rand] # [B, 2+1, 3*?]
+        batch = np.swapaxes(batch, 0, 1)
+        batch_rays, target_s = batch[:2], batch[2]
+
+        i_batch += N_rand
+        if i_batch >= rays_rgb.shape[0]:  # Shuffle data after each epoch
+            rand_idx = np.random.permutation(rays_rgb.shape[0])
+            rays_rgb = rays_rgb[rand_idx]
+            i_batch = 0
+
+        # Core optimization loop
+        rgb, rgb0 = render(H, W, K, batch_rays, chunk=args.chunk, **render_kwargs_train)
+        optimizer.zero_grad()
+        img_loss = img2mse(rgb, target_s)
+        img_loss0 = img2mse(rgb0, target_s)
+        loss = img_loss + img_loss0
+        psnr = mse2psnr(img_loss)
+        loss.backward()
+        optimizer.step()
+
+        # NOTE: IMPORTANT!
+        # Update learning rate
+        decay_rate = 0.1
+        decay_steps = args.lrate_decay * 1000
+        new_lrate = args.lrate * (decay_rate ** (i / decay_steps))
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = new_lrate
+
+        # Rest is logging
+        if (i+1) % args.i_weights == 0:
+            path = os.path.join(logdir, f'{i+1:06d}.ckpt')
+            np.savez(path, {
+                'global_step': i,
+                'network_fn_state_dict': render_kwargs_train['network_course'].state_dict(),
+                'network_fine_state_dict': render_kwargs_train['network_fine'].state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+            })
+            print('Saved checkpoints at', path)
+
+        if (i+1) % args.i_video == 0:
+            rgbs = []
+            for i, c2w in enumerate(tqdm(render_poses[:1])):
+                rays = get_rays(H, W, K, c2w[:3,:4])
+                rgb, _ = render(H, W, K, rays, chunk=args.chunk, **render_kwargs_test)
+                rgbs.append(rgb.numpy())
+            rgbs = np.stack(rgbs, 0)
+            np.savez_compressed(os.path.join(logdir, f'{args.expname}_spiral_{i+1:06d}_rgb.npz'), to8b(rgbs))
+
+        if (i+1) % args.i_print == 0:
+            tqdm.write(f"[TRAIN] Iter: {i+1} Loss: {loss.item()}  PSNR: {psnr.item()}")
+
+
+if __name__ == '__main__':
+    train(load_args())
